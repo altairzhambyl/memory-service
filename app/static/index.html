@@ -1,0 +1,832 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Memory Persistence Check</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --panel-2: #eef3f6;
+      --line: #d7dee4;
+      --text: #17212b;
+      --muted: #5f6d7a;
+      --blue: #1d5fd1;
+      --green: #137a4b;
+      --red: #b42318;
+      --shadow: 0 10px 30px rgba(23, 33, 43, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button,
+    textarea {
+      font: inherit;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 20px;
+      overflow-y: auto;
+    }
+
+    .brand {
+      margin-bottom: 22px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    .brand p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .nav-list {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 22px;
+    }
+
+    .section-label {
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin: 0 0 8px;
+    }
+
+    .nav-button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      border-radius: 8px;
+      min-height: 38px;
+      padding: 9px 12px;
+      text-align: left;
+      width: 100%;
+    }
+
+    .nav-button.active {
+      border-color: var(--blue);
+      background: #eef4ff;
+      color: var(--blue);
+      font-weight: 650;
+    }
+
+    .user-list {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 22px;
+    }
+
+    .user-button,
+    .secondary-button,
+    .send-button,
+    .session-button,
+    .new-session-button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      border-radius: 8px;
+      min-height: 40px;
+    }
+
+    .user-button {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      text-align: left;
+      width: 100%;
+    }
+
+    .user-button.active {
+      border-color: var(--blue);
+      background: #eef4ff;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .user-button.active .dot {
+      background: var(--green);
+    }
+
+    .session-list {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    .session-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 4px;
+      align-items: stretch;
+    }
+
+    .session-button {
+      padding: 8px 10px;
+      text-align: left;
+      min-height: 40px;
+      display: grid;
+      gap: 2px;
+    }
+
+    .session-button.active {
+      border-color: var(--blue);
+      background: #eef4ff;
+    }
+
+    .session-title {
+      font-weight: 600;
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-meta {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .session-delete {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--muted);
+      cursor: pointer;
+      border-radius: 8px;
+      width: 32px;
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    .session-delete:hover {
+      color: var(--red);
+      border-color: var(--red);
+    }
+
+    .new-session-button {
+      padding: 8px 10px;
+      color: var(--blue);
+      border-color: var(--blue);
+      font-weight: 600;
+      width: 100%;
+    }
+
+    .session-empty {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 8px 2px;
+    }
+
+    .main {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-width: 0;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.88);
+    }
+
+    .current-user {
+      font-size: 16px;
+      font-weight: 650;
+    }
+
+    .current-user small {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 400;
+      margin-top: 2px;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      min-height: 20px;
+      text-align: right;
+    }
+
+    .status.error {
+      color: var(--red);
+    }
+
+    .messages {
+      overflow-y: auto;
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .history-panel {
+      overflow-y: auto;
+      padding: 22px;
+      display: none;
+    }
+
+    .history-panel.active,
+    .messages.active {
+      display: flex;
+    }
+
+    .messages:not(.active) {
+      display: none;
+    }
+
+    .history-panel.active {
+      flex-direction: column;
+    }
+
+    .history-output {
+      margin: 0;
+      width: 100%;
+      min-height: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 16px;
+      color: var(--text);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .empty {
+      align-self: center;
+      margin-top: 20vh;
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 18px 22px;
+    }
+
+    .message {
+      max-width: min(760px, 84%);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 12px 14px;
+      box-shadow: var(--shadow);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      border-color: #b8c9e8;
+      background: #eef4ff;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+    }
+
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 10px;
+      padding: 16px 22px 20px;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 46px;
+      max-height: 150px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px 12px;
+      background: #fbfcfd;
+      color: var(--text);
+    }
+
+    textarea:focus,
+    button:focus-visible {
+      outline: 3px solid rgba(29, 95, 209, 0.22);
+      outline-offset: 1px;
+    }
+
+    .send-button {
+      padding: 0 18px;
+      border-color: var(--blue);
+      background: var(--blue);
+      color: white;
+      font-weight: 650;
+    }
+
+    .secondary-button {
+      padding: 0 14px;
+      color: var(--muted);
+    }
+
+    .send-button:disabled,
+    .secondary-button:disabled,
+    .user-button:disabled,
+    .nav-button:disabled,
+    .session-button:disabled,
+    .new-session-button:disabled,
+    .session-delete:disabled {
+      cursor: wait;
+      opacity: 0.62;
+    }
+
+    @media (max-width: 760px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .user-list {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .composer {
+        grid-template-columns: 1fr;
+      }
+
+      .message {
+        max-width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>Memory check</h1>
+        <p>Postgres volume chat harness</p>
+      </div>
+      <div class="nav-list" aria-label="Views">
+        <button class="nav-button active" data-view="chat" type="button">Chat</button>
+        <button class="nav-button" data-view="text" type="button">All history text</button>
+        <button class="nav-button" data-view="json" type="button">All history JSON</button>
+      </div>
+      <p class="section-label">User</p>
+      <div class="user-list" aria-label="Users">
+        <button class="user-button active" data-user="alice" type="button">
+          <span>Alice</span><span class="dot" aria-hidden="true"></span>
+        </button>
+        <button class="user-button" data-user="bob" type="button">
+          <span>Bob</span><span class="dot" aria-hidden="true"></span>
+        </button>
+      </div>
+      <p class="section-label">Sessions</p>
+      <div class="session-list" id="sessionList" aria-label="Sessions"></div>
+      <button class="new-session-button" id="newSessionButton" type="button">+ New chat</button>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="current-user" id="currentUser">Alice<small id="currentSession">—</small></div>
+        <div class="status" id="status">Ready</div>
+      </header>
+
+      <section class="messages active" id="messages" aria-live="polite"></section>
+      <section class="history-panel" id="historyTextPanel" aria-live="polite">
+        <pre class="history-output" id="historyText"></pre>
+      </section>
+      <section class="history-panel" id="historyJsonPanel" aria-live="polite">
+        <pre class="history-output" id="historyJson"></pre>
+      </section>
+
+      <form class="composer" id="composer">
+        <textarea id="messageInput" name="message" maxlength="4000" placeholder="Write a message..." required></textarea>
+        <button class="secondary-button" id="clearButton" type="button">Clear</button>
+        <button class="send-button" id="sendButton" type="submit">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script>
+    // API base resolution, dev-friendly:
+    //   1. ?api=http://host:port in URL  → saved to localStorage
+    //   2. localStorage.api_base         → sticky for this tab
+    //   3. served from :8080             → same-origin (production-ish)
+    //   4. anything else (file://, :5173, etc.) → http://localhost:8080
+    const params = new URLSearchParams(location.search);
+    const fromQuery = params.get("api");
+    if (fromQuery) localStorage.setItem("api_base", fromQuery);
+    const stored = localStorage.getItem("api_base");
+    const API_BASE = stored
+      ?? (location.port === "8080" || location.protocol.startsWith("http") && !location.port
+            ? ""
+            : "http://localhost:8080");
+
+    const state = {
+      user: "alice",
+      view: "chat",
+      sessions: [],
+      sessionId: null,
+      loading: false,
+    };
+
+    const messagesEl = document.querySelector("#messages");
+    const historyTextPanel = document.querySelector("#historyTextPanel");
+    const historyJsonPanel = document.querySelector("#historyJsonPanel");
+    const historyTextEl = document.querySelector("#historyText");
+    const historyJsonEl = document.querySelector("#historyJson");
+    const statusEl = document.querySelector("#status");
+    const inputEl = document.querySelector("#messageInput");
+    const sendButton = document.querySelector("#sendButton");
+    const clearButton = document.querySelector("#clearButton");
+    const currentUserEl = document.querySelector("#currentUser");
+    const currentSessionEl = document.querySelector("#currentSession");
+    const userButtons = [...document.querySelectorAll(".user-button")];
+    const navButtons = [...document.querySelectorAll(".nav-button")];
+    const sessionListEl = document.querySelector("#sessionList");
+    const newSessionButton = document.querySelector("#newSessionButton");
+    const composerEl = document.querySelector("#composer");
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("error", isError);
+    }
+
+    function setLoading(value) {
+      state.loading = value;
+      sendButton.disabled = value;
+      clearButton.disabled = value;
+      newSessionButton.disabled = value;
+      userButtons.forEach((button) => { button.disabled = value; });
+      navButtons.forEach((button) => { button.disabled = value; });
+      sessionListEl.querySelectorAll("button").forEach((button) => { button.disabled = value; });
+    }
+
+    function userLabel(userId) {
+      return userId === "alice" ? "Alice" : "Bob";
+    }
+
+    function formatTime(value) {
+      return new Intl.DateTimeFormat(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }).format(new Date(value));
+    }
+
+    function formatDateTime(value) {
+      return new Intl.DateTimeFormat(undefined, {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }).format(new Date(value));
+    }
+
+    function formatHistoryText(messages) {
+      if (!messages.length) return "No stored messages.";
+      return messages.map((item) => {
+        const user = userLabel(item.user_id);
+        const role = item.role === "user" ? "User" : "Assistant";
+        const session = item.session_id != null ? ` #${item.session_id}` : "";
+        return `[${formatDateTime(item.created_at)}] ${user}${session} / ${role}\n${item.content}`;
+      }).join("\n\n");
+    }
+
+    function renderTopbar() {
+      const sess = state.sessions.find((s) => s.id === state.sessionId);
+      currentUserEl.firstChild.nodeValue = userLabel(state.user);
+      currentSessionEl.textContent = sess ? `${sess.title} · #${sess.id}` : "no session";
+    }
+
+    function renderSessions() {
+      sessionListEl.innerHTML = "";
+      if (!state.sessions.length) {
+        const empty = document.createElement("div");
+        empty.className = "session-empty";
+        empty.textContent = "No chats yet — click New chat.";
+        sessionListEl.appendChild(empty);
+        return;
+      }
+      for (const sess of state.sessions) {
+        const row = document.createElement("div");
+        row.className = "session-row";
+
+        const select = document.createElement("button");
+        select.type = "button";
+        select.className = "session-button";
+        if (sess.id === state.sessionId) select.classList.add("active");
+        select.innerHTML = `
+          <span class="session-title"></span>
+          <span class="session-meta"></span>
+        `;
+        select.querySelector(".session-title").textContent = sess.title;
+        select.querySelector(".session-meta").textContent =
+          `#${sess.id} · ${sess.message_count} msg`;
+        select.addEventListener("click", () => {
+          if (state.loading || sess.id === state.sessionId) return;
+          state.sessionId = sess.id;
+          renderSessions();
+          renderTopbar();
+          loadHistory();
+        });
+
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "session-delete";
+        del.title = "Delete session";
+        del.textContent = "×";
+        del.addEventListener("click", () => {
+          if (state.loading) return;
+          deleteSession(sess.id);
+        });
+
+        row.append(select, del);
+        sessionListEl.appendChild(row);
+      }
+    }
+
+    function renderMessages(messages) {
+      messagesEl.innerHTML = "";
+      if (!messages.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = state.sessionId
+          ? "No messages in this chat yet."
+          : "Pick or create a chat to start.";
+        messagesEl.appendChild(empty);
+        return;
+      }
+
+      for (const item of messages) {
+        const node = document.createElement("article");
+        node.className = `message ${item.role}`;
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.innerHTML = `<span>${item.role}</span><span>${formatTime(item.created_at)}</span>`;
+
+        const content = document.createElement("div");
+        content.textContent = item.content;
+
+        node.append(meta, content);
+        messagesEl.appendChild(node);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    async function requestJson(url, options = {}) {
+      const response = await fetch(API_BASE + url, {
+        headers: { "content-type": "application/json" },
+        ...options,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `${response.status} ${response.statusText}`);
+      }
+      if (response.status === 204) return null;
+      return response.json();
+    }
+
+    async function loadSessions({ preferSessionId = null } = {}) {
+      setLoading(true);
+      setStatus("Loading sessions...");
+      try {
+        const data = await requestJson(`/chat/sessions?user_id=${state.user}`);
+        state.sessions = data.sessions;
+        if (preferSessionId && state.sessions.some((s) => s.id === preferSessionId)) {
+          state.sessionId = preferSessionId;
+        } else if (!state.sessions.some((s) => s.id === state.sessionId)) {
+          state.sessionId = state.sessions[0]?.id ?? null;
+        }
+        renderSessions();
+        renderTopbar();
+        setStatus(`${state.sessions.length} chats`);
+      } catch (error) {
+        setStatus("Could not load sessions", true);
+      } finally {
+        setLoading(false);
+      }
+      if (state.view === "chat") await loadHistory();
+    }
+
+    async function loadHistory() {
+      if (!state.sessionId) {
+        renderMessages([]);
+        return;
+      }
+      setLoading(true);
+      setStatus("Loading history...");
+      try {
+        const data = await requestJson(`/chat/history?session_id=${state.sessionId}`);
+        renderMessages(data.messages);
+        setStatus(`${data.messages.length} messages in this chat`);
+      } catch (error) {
+        setStatus("Could not load history", true);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    async function loadAllHistory() {
+      setLoading(true);
+      setStatus("Loading all history...");
+      try {
+        const data = await requestJson("/chat/all");
+        historyTextEl.textContent = formatHistoryText(data.messages);
+        historyJsonEl.textContent = JSON.stringify(data.messages, null, 2);
+        setStatus(`${data.messages.length} total messages`);
+      } catch (error) {
+        setStatus("Could not load all history", true);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    async function sendMessage(message) {
+      if (!state.sessionId) {
+        setStatus("Create a chat first", true);
+        return;
+      }
+      setLoading(true);
+      setStatus("Waiting for LLM...");
+      try {
+        const data = await requestJson("/chat", {
+          method: "POST",
+          body: JSON.stringify({ session_id: state.sessionId, message }),
+        });
+        renderMessages(data.messages);
+        const sess = state.sessions.find((s) => s.id === state.sessionId);
+        if (sess) sess.message_count = data.messages.length;
+        renderSessions();
+        setStatus(`${data.messages.length} messages in this chat`);
+      } catch (error) {
+        setStatus("LLM or server error", true);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    async function clearHistory() {
+      if (!state.sessionId) return;
+      setLoading(true);
+      setStatus("Clearing...");
+      try {
+        await requestJson(`/chat/history?session_id=${state.sessionId}`, { method: "DELETE" });
+        renderMessages([]);
+        const sess = state.sessions.find((s) => s.id === state.sessionId);
+        if (sess) sess.message_count = 0;
+        renderSessions();
+        setStatus("Chat cleared");
+      } catch (error) {
+        setStatus("Could not clear chat", true);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    async function createSession() {
+      setLoading(true);
+      setStatus("Creating chat...");
+      try {
+        const title = `Chat ${new Date().toLocaleString()}`;
+        const data = await requestJson("/chat/sessions", {
+          method: "POST",
+          body: JSON.stringify({ user_id: state.user, title }),
+        });
+        await loadSessions({ preferSessionId: data.session.id });
+      } catch (error) {
+        setStatus("Could not create chat", true);
+        setLoading(false);
+      }
+    }
+
+    async function deleteSession(sessionId) {
+      setLoading(true);
+      setStatus("Deleting chat...");
+      try {
+        await requestJson(`/chat/sessions/${sessionId}`, { method: "DELETE" });
+        if (state.sessionId === sessionId) state.sessionId = null;
+        await loadSessions();
+      } catch (error) {
+        setStatus("Could not delete chat", true);
+        setLoading(false);
+      }
+    }
+
+    function selectUser(user) {
+      state.user = user;
+      state.sessionId = null;
+      userButtons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.user === user);
+      });
+      renderTopbar();
+      loadSessions();
+    }
+
+    function selectView(view) {
+      state.view = view;
+      navButtons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.view === view);
+      });
+
+      messagesEl.classList.toggle("active", view === "chat");
+      historyTextPanel.classList.toggle("active", view === "text");
+      historyJsonPanel.classList.toggle("active", view === "json");
+      composerEl.style.display = view === "chat" ? "grid" : "none";
+
+      if (view === "chat") {
+        renderTopbar();
+        loadHistory();
+      } else {
+        currentUserEl.firstChild.nodeValue =
+          view === "text" ? "All history text" : "All history JSON";
+        currentSessionEl.textContent = "across all users";
+        loadAllHistory();
+      }
+    }
+
+    document.querySelector("#composer").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const message = inputEl.value.trim();
+      if (!message || state.loading) return;
+      inputEl.value = "";
+      sendMessage(message);
+    });
+
+    clearButton.addEventListener("click", () => {
+      if (!state.loading) clearHistory();
+    });
+
+    newSessionButton.addEventListener("click", () => {
+      if (!state.loading) createSession();
+    });
+
+    userButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!state.loading) selectUser(button.dataset.user);
+      });
+    });
+
+    navButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!state.loading) selectView(button.dataset.view);
+      });
+    });
+
+    loadSessions();
+  </script>
+</body>
+</html>
