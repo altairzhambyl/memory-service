@@ -1,0 +1,120 @@
+{
+  "_comment": "Self-eval fixture. Shape matches POST /turns so it stays valid when the contract endpoints land. Two users — Alice and Bob — with disjoint facts; the test is whether /query for one user ever surfaces the other's facts (concurrent sessions). Alice's employment changes mid-arc to exercise supersession.",
+
+  "turns": [
+    {
+      "session_id": "alice-s1",
+      "user_id": "user-alice",
+      "timestamp": "2026-04-10T09:15:00Z",
+      "metadata": { "user_name": "Alice" },
+      "messages": [
+        { "role": "user", "content": "Hey, just got back from walking Biscuit in Tiergarten. Berlin in spring is unreal." },
+        { "role": "assistant", "content": "Sounds lovely! How long have you had Biscuit?" }
+      ]
+    },
+    {
+      "session_id": "alice-s1",
+      "user_id": "user-alice",
+      "timestamp": "2026-04-10T09:16:00Z",
+      "metadata": { "user_name": "Alice" },
+      "messages": [
+        { "role": "user", "content": "About four years. He's a beagle. By the way I'm vegetarian, can you suggest a brunch place near Mitte?" },
+        { "role": "assistant", "content": "Sure — House of Small Wonder or Silo Coffee both have great vegetarian options." }
+      ]
+    },
+    {
+      "session_id": "alice-s2",
+      "user_id": "user-alice",
+      "timestamp": "2026-04-15T18:20:00Z",
+      "metadata": { "user_name": "Alice" },
+      "messages": [
+        { "role": "user", "content": "Tough day at Stripe. Roadmap planning ran three hours over." },
+        { "role": "assistant", "content": "Ouch. Are you the PM driving the agenda?" },
+        { "role": "user", "content": "Yeah, PM on the payments team." }
+      ]
+    },
+    {
+      "session_id": "alice-s3",
+      "user_id": "user-alice",
+      "timestamp": "2026-04-28T11:00:00Z",
+      "metadata": { "user_name": "Alice", "supersession_hint": "employment" },
+      "messages": [
+        { "role": "user", "content": "Big news — I just signed at Notion. Starting Monday as a senior PM on the AI team. Leaving Stripe was hard but the offer was too good." },
+        { "role": "assistant", "content": "Congratulations! That's a huge move. What pulled you in?" },
+        { "role": "user", "content": "The AI roadmap, mostly. Also closer to home — I can bike to the office now." }
+      ]
+    },
+
+    {
+      "session_id": "bob-s1",
+      "user_id": "user-bob",
+      "timestamp": "2026-04-11T14:00:00Z",
+      "metadata": { "user_name": "Bob" },
+      "messages": [
+        { "role": "user", "content": "Mochi knocked over my coffee for the third time this week. Cats." },
+        { "role": "assistant", "content": "Ha! How old is Mochi?" },
+        { "role": "user", "content": "Two. Tortoiseshell. We rescued her from a shelter in Lisbon last summer." }
+      ]
+    },
+    {
+      "session_id": "bob-s1",
+      "user_id": "user-bob",
+      "timestamp": "2026-04-11T14:05:00Z",
+      "metadata": { "user_name": "Bob" },
+      "messages": [
+        { "role": "user", "content": "Anyway, on-call week from hell at Cloudflare. Three pager incidents in two days." },
+        { "role": "assistant", "content": "Brutal. SRE team or product?" },
+        { "role": "user", "content": "SRE — edge network. Also FYI I'm allergic to peanuts, so any snack suggestions for late-night ops, skip the Snickers." }
+      ]
+    },
+    {
+      "session_id": "bob-s2",
+      "user_id": "user-bob",
+      "timestamp": "2026-04-22T20:30:00Z",
+      "metadata": { "user_name": "Bob", "correction_hint": true },
+      "messages": [
+        { "role": "user", "content": "Actually, sorry — I said tortoiseshell earlier. Mochi is a calico. My partner just corrected me." },
+        { "role": "assistant", "content": "Noted! Calico it is." }
+      ]
+    }
+  ],
+
+  "probes": [
+    {
+      "query": "Where does the user live?",
+      "user_id": "user-alice",
+      "expect_contains": ["Berlin"],
+      "must_not_contain": ["Lisbon"]
+    },
+    {
+      "query": "What is the user's pet's name?",
+      "user_id": "user-alice",
+      "expect_contains": ["Biscuit"],
+      "must_not_contain": ["Mochi"]
+    },
+    {
+      "query": "Where does the user work now?",
+      "user_id": "user-alice",
+      "expect_contains": ["Notion"],
+      "must_not_contain_strict": ["Stripe is current"]
+    },
+    {
+      "query": "Where does the user live?",
+      "user_id": "user-bob",
+      "expect_contains": ["Lisbon"],
+      "must_not_contain": ["Berlin"]
+    },
+    {
+      "query": "What is the user's pet's name?",
+      "user_id": "user-bob",
+      "expect_contains": ["Mochi"],
+      "must_not_contain": ["Biscuit"]
+    },
+    {
+      "query": "Any allergies?",
+      "user_id": "user-bob",
+      "expect_contains": ["peanut"],
+      "must_not_contain": ["shellfish"]
+    }
+  ]
+}
