@@ -1,11 +1,12 @@
-"""HTTP routes — health, ingest, query. Read top-to-bottom; that's the whole API."""
+"""HTTP routes — §3 contract + manual /chat harness. Read top-to-bottom."""
 
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 
 from app.api.schemas import (
@@ -23,6 +24,13 @@ from app.api.schemas import (
     QueryHit,
     QueryRequest,
     QueryResponse,
+    RecallRequest,
+    RecallResponse,
+    SearchRequest,
+    SearchResponse,
+    TurnRequest,
+    TurnResponse,
+    UserMemoriesResponse,
 )
 from app.config import get_settings
 from app.db.pool import get_pool
@@ -363,3 +371,77 @@ async def delete_chat_history(
             session_id,
         )
     return ChatDeleteResponse(deleted=int(result.split()[-1]))
+
+
+# =====================================================================
+# §3 contract endpoints. These are the eval-facing surface.
+# HGT-15 ships only the shapes + synchronous /turns persistence;
+# HGT-16/17 fill in recall, search, and structured memories.
+# =====================================================================
+
+
+@router.post("/turns", response_model=TurnResponse, status_code=201)
+async def create_turn(payload: TurnRequest) -> TurnResponse:
+    """Persist a turn + its messages synchronously. Returns the turn id."""
+    turn_id = str(uuid.uuid4())
+    pool = get_pool()
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO turns (id, session_id, user_id, ts, metadata)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            """,
+            turn_id,
+            payload.session_id,
+            payload.user_id,
+            payload.timestamp,
+            _to_jsonb(payload.metadata),
+        )
+        for idx, msg in enumerate(payload.messages):
+            await conn.execute(
+                """
+                INSERT INTO turn_messages (turn_id, idx, role, name, content)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                turn_id, idx, msg.role, msg.name, msg.content,
+            )
+    return TurnResponse(id=turn_id)
+
+
+@router.post("/recall", response_model=RecallResponse)
+async def recall(payload: RecallRequest) -> RecallResponse:
+    """Cold shape until HGT-16 wires real recall. Never errors on empty store."""
+    _ = payload  # request validated; no use yet
+    return RecallResponse(context="", citations=[])
+
+
+@router.post("/search", response_model=SearchResponse)
+async def search(payload: SearchRequest) -> SearchResponse:
+    """Cold shape until HGT-16 wires real search."""
+    _ = payload
+    return SearchResponse(results=[])
+
+
+@router.get("/users/{user_id}/memories", response_model=UserMemoriesResponse)
+async def list_user_memories(user_id: str) -> UserMemoriesResponse:
+    """Cold shape until HGT-17 populates structured memories."""
+    _ = user_id
+    return UserMemoriesResponse(memories=[])
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+async def delete_section3_session(session_id: str) -> Response:
+    """Drop every turn for the §3 string session_id; turn_messages cascade."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM turns WHERE session_id = $1", session_id)
+    return Response(status_code=204)
+
+
+@router.delete("/users/{user_id}", status_code=204)
+async def delete_section3_user(user_id: str) -> Response:
+    """Drop every turn for this user across all sessions."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM turns WHERE user_id = $1", user_id)
+    return Response(status_code=204)
