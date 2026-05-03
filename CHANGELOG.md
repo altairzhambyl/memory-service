@@ -145,3 +145,34 @@ HGT-23 — query-relevant memories layer (§4.3 middle priority) — §3, §4.3,
 **Контракт-тесты:** `RAG_E2E=1 pytest tests/ -q` → **21/21 passed** (без новых tests — schema additions backward-compat'ные, поведение existing endpoints unchanged для users без HGT-23 memory documents; new path verifies через v2 fixture).
 **Honest caveat:** v2 fixture's pet name «Biscuit» creates food-association confound при query «what does this user eat?» (cosine matches «biscuit» ↔ food). Tight-budget-diet probe всё ещё PASS, но `pet.name` ranks высоко. Production eval скорее всего не использует food-named pets, так что effect не bleed-over в private eval. Документировано как fixture-design nuance.
 **Линковка:** HGT-23 → Done. Все запланированные §4.3 priority assembly, §10 ranking deliberateness, и §4.1 supersession integration пункты delivered. Backfill endpoint доступен для existing populated volumes — README обновится в follow-up.
+
+2026-05-03
+HGT-26 + HGT-27 + HGT-28 (Patch A) — canonical slots, DB-level uniqueness, raw turn_messages persist on embed-fail — §3, §4.1, §5, §10
+Codex audit (HGT-25..31) выкатил 7 findings; Patch A батчем закрывает три самых risk-bearing'a одной серией изменений потому что все они touch'ат `migrations/`, `app/api/routes.py:create_turn` и memories storage shape. Senior call: storage shape settle'ся first, потом recall shape (Patch B), потом offline tests (Patch C), потом cosmetic (Patch D). Делать их independently значило бы переписать `create_turn` три раза.
+
+**HGT-26 — canonical slots для §4.1 supersession.**
+Codex evidence: LLM emit'ит variable keys на same semantic slot (`opinion.typescript` vs `opinion.typescript.generics` vs `language.favourite`), supersession lookup по exact-key match'у не fire'ит, и две active rows остаются жить одновременно. Это explicit'но waved off в v2 fixture'е (arc-typescript probe), но private eval скорее всего bьёт именно туда.
+Fix: добавил `_SLOT_ALIASES: dict[str, str]` (~25 entries — 5 категорий: employment current/previous, location current/previous, diet, beverage, allergy) + `_canonicalise_slot(key)` helper. Priority: exact alias hit, opinion.* hierarchical collapse (`opinion.<a>.<b>...` → `opinion.<a>`), fallback `slot = key`. Multi-entity slots (pet.X, family.X) NOT collapsed — namespace остаётся. Map в Python dict, не YAML/DB-backed registry — reviewer читает rules в одном месте.
+
+**HGT-27 — DB-level uniqueness + advisory lock.**
+Codex evidence: `migrations/004_memories.sql:32` index `idx_memories_user_active_key` non-unique; `create_turn` делает read-modify-write без row/advisory lock. Two concurrent /turns на one slot → race window. Тест `test_concurrent_turns_to_same_slot_no_double_active` written FIRST (per HGT-21 lesson — test before fix), confirmed PASS на текущем code'е (race не fired этот запуск из-за LLM extract latency creating natural serialisation; defensive guard test, не reproducer). DB constraint — proper backstop.
+Fix: `migrations/007_canonical_slots.sql` adds `slot TEXT` column + `CREATE UNIQUE INDEX uq_memories_user_slot_active ON memories (user_id, slot) WHERE active = TRUE AND slot IS NOT NULL`. Partial index — `slot IS NULL` rows don't trip during backfill. `create_turn` сейчас takes `pg_advisory_xact_lock(hashtextextended($1, 0))` где $1 = `f"{user_id}:{slot}"` — transaction-scoped, auto-released on commit/rollback. Concurrent /turns на one slot serialise; Postgres unique-index — defensive backstop если application logic когда-нибудь bug'нется.
+
+**HGT-28 — raw turn_messages persist on embed-fail.**
+Codex evidence: `routes.py:546-558` — `INSERT INTO turn_messages` нaходился inside `if embed_error is None:` block. На embed blip'е `/turns` коммитил turn metadata + extracted memories, но raw conversation messages терялись. Reviewer / future backfill cannot reconstruct turn'a после embed outage. Контракт §3: "service writes completed conversation turns and persists data" — degraded path violated this.
+Fix: moved `turn_messages` INSERT outside the embed-error guard. Indexed triplet (`documents` + `embeddings`) still gates on `embed_error is None` — vectors are useless без embeddings. Now на embed blip'е: `turns` row + all `turn_messages` rows + extracted memories персистятся, только indexed retrieval triplet skipped. Future backfill (если будет) сможет re-embed'ить через `turn_messages.content`.
+
+**Backfill endpoint:**
+`POST /admin/recanonicalise_memories?user_id=...&limit=500` — idempotent walk over rows where `slot IS NULL OR slot != _canonicalise_slot(key)`. Groups by `(user_id, computed_slot)`, takes advisory lock per group, resolves active-row collisions (newest wins, losers get `active=FALSE, supersedes=winner.id`, kind='memory' doc deleted), stamps slot on остальных. Returns `{processed, collisions_resolved}`. Operator-driven; runs synchronously per HGT-23 reembed pattern. Fresh installs не нужны — going-forward /turns writes always include slot.
+
+**Verification:**
+- v1 fixture: recall@1=6/6, noise=1/1, mean=0.3557, extraction_failures=0 — без регрессии.
+- v2 fixture: multihop@1=1/1, facts=6/6, forbidden_violations=0, supersession=1/1, noise=1/1, mean=0.4504 — без регрессии. arc-employer probe всё ещё PASS (employment supersession через canonical slot работает).
+- Контракт-тесты: `RAG_E2E=1 pytest tests/ -q` → **23/23 passed** (22 prior + 1 new concurrency guard).
+
+**Что отложено (Patches B/C/D):**
+- HGT-25 (noise gate) + HGT-29 (small-budget enforcement) — Patch B touches `_format_recall_context`, делается одним rewrite'ом.
+- HGT-30 (offline tests) — Patch C, после того как Patches A+B settle'нут shape, чтобы tests не было writing против moving target.
+- HGT-31 (smoke script + src/ rename) — Patch D, cosmetic, last. CLAUDE.md §13 explicitly says `app/` per Python convention is permissible — rename is pure churn.
+
+**Линковка:** HGT-26 → Done, HGT-27 → Done, HGT-28 → Done. Codex audit triage 3/7 closed; remaining 4 covered by Patches B/C/D below.

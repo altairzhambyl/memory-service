@@ -502,3 +502,93 @@ def test_recall_query_aware_memory_ranking():
             )
     finally:
         httpx.delete(f"{BASE}/users/{uid}", timeout=10)
+
+
+# =====================================================================
+# HGT-27 — DB-level uniqueness + concurrency safety. Two concurrent
+# /turns posts to the same canonical slot must NOT produce two active
+# rows. Evidence required: written BEFORE the migration/lock landed,
+# expected to FAIL on current code, then flip to PASS after Patch A.
+# =====================================================================
+
+
+def test_concurrent_turns_to_same_slot_no_double_active():
+    """§4.1 / §5: two parallel /turns claiming the same canonical slot
+    (different employer values) must be serialised at the DB level.
+    Exactly one active row should remain; the other must be inactive
+    with `supersedes` linking back to the winner.
+    """
+    import threading
+
+    sid_a = _unique("sess-c-a")
+    sid_b = _unique("sess-c-b")
+    uid = _unique("user-conc")
+
+    def post(sid: str, content: str, results: list, idx: int):
+        try:
+            r = httpx.post(
+                f"{BASE}/turns",
+                json={
+                    "session_id": sid,
+                    "user_id": uid,
+                    "messages": [
+                        {"role": "user", "content": content},
+                        {"role": "assistant", "content": "ok"},
+                    ],
+                    "timestamp": "2026-05-03T12:00:00Z",
+                    "metadata": {},
+                },
+                timeout=60,
+            )
+            results[idx] = r
+        except Exception as exc:
+            results[idx] = exc
+
+    try:
+        results: list = [None, None]
+        ta = threading.Thread(
+            target=post, args=(sid_a, "I work at Stripe as a payments engineer.", results, 0),
+        )
+        tb = threading.Thread(
+            target=post, args=(sid_b, "I just started at Notion as a PM.", results, 1),
+        )
+        ta.start(); tb.start()
+        ta.join(); tb.join()
+
+        # Both must complete with 201; concurrent failures aren't acceptable
+        # under §5 hard constraints.
+        for r in results:
+            assert isinstance(r, httpx.Response), f"unexpected: {r!r}"
+            assert r.status_code == 201, r.text
+
+        mems = httpx.get(f"{BASE}/users/{uid}/memories", timeout=10).json()["memories"]
+        # Filter to employment-slot rows (LLM may emit `employment.company`,
+        # `employment.role`, `employment.previous_company` — supersession
+        # should leave at most one active per slot, not per key. After
+        # Patch A, the slot column will collapse these.
+        company_rows = [m for m in mems if m["key"] == "employment.company"]
+        active_company = [m for m in company_rows if m["active"]]
+        inactive_company = [m for m in company_rows if not m["active"]]
+        assert len(active_company) == 1, (
+            f"expected exactly 1 active employment.company row, got "
+            f"{len(active_company)}: {active_company}"
+        )
+        # The losing turn must have superseded the winning one (or vice
+        # versa) — at least one inactive row, and its supersedes must
+        # reference an existing row in the same key.
+        assert len(inactive_company) >= 1, (
+            f"expected ≥1 inactive employment.company row, got "
+            f"{inactive_company}; both turns kept their values active"
+        )
+        active_id = active_company[0]["id"]
+        inactive_ids = {m["id"] for m in inactive_company}
+        # supersedes chain points forward; at least one inactive row's
+        # supersedes should be in the (active|other inactive) set.
+        all_ids = inactive_ids | {active_id}
+        for ina in inactive_company:
+            sup = ina["supersedes"]
+            assert sup in all_ids or sup is None, (
+                f"inactive row {ina['id']} has dangling supersedes={sup}"
+            )
+    finally:
+        httpx.delete(f"{BASE}/users/{uid}", timeout=10)

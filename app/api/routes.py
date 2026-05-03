@@ -95,6 +95,69 @@ router = APIRouter()
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 
 
+# §4.1 canonical-slot map (HGT-26). Maps LLM-emitted display keys to a
+# stable supersession slot so a new fact can replace an old one even
+# when the LLM picked a different key namespace. Rules are deterministic
+# and intentionally narrow — we only collapse the 5 categories where
+# variance is observed against v1+v2 fixtures (employment, location,
+# diet, beverage, allergy). Multi-entity users (two pets, two children)
+# keep `slot = key` so they don't collapse onto each other.
+_SLOT_ALIASES: dict[str, str] = {
+    # current employer
+    "employment.company": "employment.current_company",
+    "employment.current_company": "employment.current_company",
+    "employer": "employment.current_company",
+    "current_employer": "employment.current_company",
+    "company": "employment.current_company",
+    # current role
+    "employment.role": "employment.current_role",
+    "employment.current_role": "employment.current_role",
+    "job.title": "employment.current_role",
+    "role": "employment.current_role",
+    # previous employer / role
+    "employment.previous_company": "employment.previous_company",
+    "previous_employer": "employment.previous_company",
+    "past_employer": "employment.previous_company",
+    "employment.previous_role": "employment.previous_role",
+    # current / previous city
+    "location.city": "location.current_city",
+    "location.current_city": "location.current_city",
+    "current_city": "location.current_city",
+    "city": "location.current_city",
+    "location.previous_city": "location.previous_city",
+    "previous_city": "location.previous_city",
+    "past_city": "location.previous_city",
+    # diet / allergy / beverage
+    "diet.style": "diet.style",
+    "diet": "diet.style",
+    "allergy": "allergy",
+    "allergies": "allergy",
+    "beverage.coffee": "beverage.coffee",
+    "drinks.coffee": "beverage.coffee",
+}
+
+
+def _canonicalise_slot(key: str) -> str:
+    """
+    Map an LLM-emitted memory key to a canonical supersession slot.
+
+    Priority:
+      1. Exact alias from `_SLOT_ALIASES`.
+      2. `opinion.<a>.<b>...` collapses hierarchically to
+         `opinion.<a>` so opinion arcs supersede across LLM key variants
+         (`opinion.typescript`, `opinion.typescript.generics` → both
+         live in slot `opinion.typescript`).
+      3. Fallback: slot = key.
+    """
+    if key in _SLOT_ALIASES:
+        return _SLOT_ALIASES[key]
+    if key.startswith("opinion."):
+        parts = key.split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[:2])
+    return key
+
+
 def _to_jsonb(d: dict) -> str:
     """asyncpg accepts JSONB as text — keep the cast in one place."""
     return json.dumps(d, ensure_ascii=False)
@@ -543,21 +606,25 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             payload.timestamp,
             _to_jsonb(turn_metadata),
         )
+        # HGT-28: raw turn_messages persist on every 201 — even when
+        # embed fails. The §3 contract is "service writes completed
+        # conversation turns and persists data"; degrading to "no
+        # raw text on disk" would leave reviewers and any future
+        # backfill path with nothing to reconstruct from. The indexed
+        # triplet (documents + embeddings) still gates on `embed_error
+        # is None` because those rows are useless without vectors.
+        for idx, msg in enumerate(payload.messages):
+            await conn.execute(
+                """
+                INSERT INTO turn_messages (turn_id, idx, role, name, content)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                turn_id, idx, msg.role, msg.name, msg.content,
+            )
         if embed_error is None:
-            # Only write the indexed-conversation triplet when we have
-            # vectors. Without embeddings, turn_messages would be invisible
-            # to /recall anyway, so persisting them costs storage with no
-            # retrieval payoff. A future backfill path can re-ingest.
             for idx, (msg, vec) in enumerate(
                 zip(payload.messages, turn_vectors, strict=True)
             ):
-                await conn.execute(
-                    """
-                    INSERT INTO turn_messages (turn_id, idx, role, name, content)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    turn_id, idx, msg.role, msg.name, msg.content,
-                )
                 doc_id = f"turn:{turn_id}:{idx}"
                 provenance = {
                     "kind": "turn_message",
@@ -585,25 +652,38 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 )
 
         for mem_idx, mem in enumerate(extracted):
-            # §4.1 supersession on (user_id, key). Three cases:
+            # §4.1 supersession on (user_id, slot). Three cases:
             #   1. No prior active row     → plain insert.
-            #   2. Same key, same value    → idempotent: refresh
+            #   2. Same slot, same value   → idempotent: refresh
             #      the existing row's updated_at and skip insert.
             #      Avoids polluting `## Known facts` with duplicates
             #      when the user re-states a fact across turns.
-            #   3. Same key, new value     → insert new row with
+            #   3. Same slot, new value    → insert new row with
             #      supersedes=old.id, flip old.active=FALSE.
             #      Old row stays for /users/{id}/memories history;
             #      its kind='memory' document is deleted so /recall
             #      doesn't re-surface stale facts via the hybrid
             #      memory retriever (HGT-23).
+            #
+            # HGT-26 lookup uses canonical slot, not the raw LLM key,
+            # so opinion.typescript.generics and opinion.typescript
+            # collapse onto the same slot. HGT-27 takes a transaction-
+            # scoped advisory lock on (user_id, slot) before the
+            # read-modify-write so concurrent /turns to the same slot
+            # serialise — the partial unique index on
+            # (user_id, slot) WHERE active=TRUE is the DB backstop.
+            slot = _canonicalise_slot(mem["key"])
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"{payload.user_id}:{slot}",
+            )
             prior = await conn.fetchrow(
                 """
                 SELECT id, value
                 FROM   memories
-                WHERE  user_id = $1 AND key = $2 AND active = TRUE
+                WHERE  user_id = $1 AND slot = $2 AND active = TRUE
                 """,
-                payload.user_id, mem["key"],
+                payload.user_id, slot,
             )
             if prior is not None and prior["value"] == mem["value"]:
                 await conn.execute(
@@ -633,9 +713,9 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 """
                 INSERT INTO memories (
                     id, user_id, type, key, value, confidence,
-                    source_session, source_turn, supersedes, active
+                    source_session, source_turn, supersedes, active, slot
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10)
                 """,
                 new_id,
                 payload.user_id,
@@ -646,6 +726,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 payload.session_id,
                 turn_id,
                 supersedes,
+                slot,
             )
             # HGT-23: write the sibling kind='memory' document + embedding
             # so /recall can rank facts by query similarity. Embed budget
@@ -1421,6 +1502,121 @@ async def admin_reembed_memories(
             )
             processed += 1
     return {"processed": processed, "skipped": 0, "failed": 0, "error": None}
+
+
+@router.post("/admin/recanonicalise_memories")
+async def admin_recanonicalise_memories(
+    user_id: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> dict:
+    """
+    HGT-26 backfill: walk memories whose `slot` is NULL or stale,
+    apply `_canonicalise_slot(key)`, and resolve any active-row
+    collisions that emerge by superseding older losers to the newest
+    winner per `(user_id, slot)`. Idempotent — second run on a clean
+    state returns `processed=0`.
+
+    Operator-driven; runs synchronously in the foreground inside the
+    §3 budget via internal `limit`. Call repeatedly until
+    `processed=0`. Fresh installs do not need this — going-forward
+    /turns writes always include `slot`.
+    """
+    pool = get_pool()
+    where = ["(slot IS NULL OR slot <> $1)"]  # placeholder; we replace below
+    # Build dynamic WHERE: rows missing slot OR with stale slot for the
+    # current canonicalisation. Stale-detection is computed in Python
+    # against `key`, so the SQL just pulls all rows scoped by user_id
+    # and we filter in memory.
+    args: list[object] = []
+    sql_where = ["TRUE"]
+    if user_id is not None:
+        args.append(user_id)
+        sql_where.append(f"user_id = ${len(args)}")
+    args.append(limit)
+    sql = f"""
+        SELECT id, user_id, key, value, active, updated_at, slot
+        FROM   memories
+        WHERE  {' AND '.join(sql_where)}
+        ORDER BY user_id, updated_at DESC, id ASC
+        LIMIT  ${len(args)}
+    """
+
+    async with pool.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(sql, *args)
+        # Group by (user_id, computed canonical slot). Skip rows whose
+        # current `slot` already matches — idempotency guard.
+        groups: dict[tuple[str, str], list] = {}
+        for r in rows:
+            canonical = _canonicalise_slot(r["key"])
+            if r["slot"] == canonical:
+                continue
+            groups.setdefault((r["user_id"], canonical), []).append(r)
+
+        processed = 0
+        collisions_resolved = 0
+        for (uid, slot), rs in groups.items():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"{uid}:{slot}",
+            )
+            # Existing active row in this slot (e.g. set by a concurrent
+            # /turns or a prior backfill batch) must be respected.
+            existing_active = await conn.fetchrow(
+                """
+                SELECT id, updated_at FROM memories
+                WHERE user_id = $1 AND slot = $2 AND active = TRUE
+                """,
+                uid, slot,
+            )
+            actives = sorted(
+                [r for r in rs if r["active"]],
+                key=lambda r: r["updated_at"], reverse=True,
+            )
+            if existing_active is not None:
+                # Pre-existing winner — losers among `actives` get
+                # inactivated and pointed at the existing winner.
+                winner_id = existing_active["id"]
+                losers = actives
+            elif actives:
+                winner_id = actives[0]["id"]
+                losers = actives[1:]
+            else:
+                winner_id = None
+                losers = []
+
+            for loser in losers:
+                await conn.execute(
+                    """
+                    UPDATE memories
+                    SET    active = FALSE,
+                           supersedes = $1,
+                           slot = $2,
+                           updated_at = NOW()
+                    WHERE  id = $3
+                    """,
+                    winner_id, slot, loser["id"],
+                )
+                await conn.execute(
+                    "DELETE FROM documents WHERE id = $1",
+                    f"mem:{loser['id']}",
+                )
+                collisions_resolved += 1
+                processed += 1
+
+            # Stamp slot on every row in the group that doesn't already
+            # have it (active winner + any inactive history rows).
+            for r in rs:
+                if r["id"] in {l["id"] for l in losers}:
+                    continue
+                await conn.execute(
+                    "UPDATE memories SET slot = $1 WHERE id = $2 AND (slot IS DISTINCT FROM $1)",
+                    slot, r["id"],
+                )
+                processed += 1
+    return {
+        "processed": processed,
+        "collisions_resolved": collisions_resolved,
+    }
 
 
 @router.post("/admin/inject_embed_failure")
