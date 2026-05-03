@@ -19,6 +19,27 @@ panel with editable JSON, response viewer, and verdict pills. Run the
 recall fixture from card 5 and you should see `recall@1 6/6,
 recall@3 6/6, noise 1/1, mean 0.356, extraction_failures 0/5`.
 
+## Что сделано
+
+- контракт. 7 endpoints, exact shapes, статусы, persistence через named volume.
+- Извлечение. `gpt-4o-mini` Structured Outputs, 8 категорий , graceful degradation на transient OpenAI fail.
+- Хранилище. Postgres + pgvector, один volume, 7 миграций. Один store, одна транзакция per `/turns`.
+- Supersession . Canonical `slot` map + partial UNIQUE на `(user_id, slot) WHERE active=TRUE` + `pg_advisory_xact_lock`. История цепочки видна в `/users/{id}/memories`.
+- Hybrid retrieval . Cosine top-30 + Postgres FTS top-30, RRF k=60. Не vanilla cosine top-k.
+- Query-aware facts . Sibling `kind='memory'` documents, hybrid-rank по query similarity. Под tight budget irrelevant facts отбрасываются first.
+- Noise gate . Block-level relevance check + per-hit cosine filter. Off-topic queries возвращают cold context.
+- Graceful upstream . Embed/extract failures → 201 with `embed_error`/`extraction_error` в metadata, никогда 5xx на transient blip. Both fail → 503 retryable.
+- Tests. 19 offline + 23 live = **42 passed**. Fixtures: v1 (floor: recall@1=6/6) + v2 (multi-hop, kw-anchored, supersession arcs, tight-budget, noise-typed-user — 9 probes, all PASS).
+- CHANGELOG. 13 metric-bearing entries, минимум 4+ перевыполнен.
+- Inspection UI. Все endpoints + admin observability + fixture runner с verdict pills.
+
+## Что не сделано
+
+- `app/` → `src/` rename. the requirements разрешает `app/`. Pure churn без runtime gain.
+- Async/background re-embed или re-slot job. Out of scope . `/turns` остаётся synchronous.
+- LLM-judge canonicalization. Лишняя latency и non-determinism пока deterministic slot map не оказался недостаточным.
+- Per-fact relevance gate. Текущий recall использует query-aware ranking + budget ordering. Stricter off-topic fact gate — следующий hardening step, **MS-32**, потому что noise resistance это named eval category.
+
 ## Architecture
 
 ```
@@ -62,8 +83,10 @@ Everything lives in one named Docker volume (`rag-db-data`) so
 - `documents` carries provenance JSONB (`kind`, `turn_id`,
   `session_id`, `user_id`, `role`, `idx`, `ts`) for citations and for
   scoping cosine queries by `user_id`.
-- `memories` is a real append-only chain: `supersedes` self-FK +
-  `active` boolean. `/users/{id}/memories` returns the full chain;
+- `memories` is a real append-only chain: `supersedes` text pointer,
+  canonical `slot`, and `active` boolean. A partial unique index on
+  `(user_id, slot) WHERE active=TRUE` prevents two current facts in the
+  same semantic slot; `/users/{id}/memories` returns the full chain and
   `/recall` filters `active=TRUE` for current state.
 
 We considered Kuzu / Qdrant / a separate vector DB earlier but pulled
@@ -108,11 +131,12 @@ retries; under that default a 429 burst can chain 3 × 30 s and blow
 the 60 s `/turns` budget. Single attempt or fail.
 
 **Deliberately unsupported (current).** Multi-turn corrections that
-require remembering a *previous* turn's content (we only see one turn
-at a time). Long opinion arcs are stored as separate `opinion.<topic>`
-rows; the full arc is reconstructable from the supersession chain in
-`/users/{id}/memories` but `/recall` currently surfaces only the
-latest active opinion. Documented as a known limitation.
+require remembering a *previous* turn's content are handled only when
+the new extraction lands in the same canonical slot. There is no
+LLM-judge over the full history. Long opinion arcs are stored under a
+canonical `opinion.<topic>` slot; the full arc is reconstructable from
+the supersession chain in `/users/{id}/memories`, while `/recall`
+surfaces only the latest active opinion.
 
 ## Recall strategy
 
@@ -194,11 +218,23 @@ citation for provenance but never used as a recall filter.
 
 Insert path in `create_turn`, three branches per extracted memory:
 
-| Prior `(user_id, key)` active row | Action |
+| Prior `(user_id, slot)` active row | Action |
 |---|---|
 | none | plain insert, `supersedes=NULL` |
 | same value | idempotent: `UPDATE memories SET updated_at=NOW()`; no new row |
 | different value | mark old `active=FALSE, updated_at=NOW()`; insert new with `supersedes=old.id` |
+
+`slot` is deterministic canonicalization over the LLM-emitted display
+`key`: employer/location/diet/allergy aliases collapse to stable slots
+(`employment.current_company`, `location.current_city`, etc.), and
+`opinion.<topic>.*` collapses to `opinion.<topic>`. The original `key`
+and `value` remain inspectable in `/users/{id}/memories`.
+
+Concurrency is guarded twice: `/turns` takes a transaction-scoped
+Postgres advisory lock on `(user_id, slot)`, and migration
+`007_canonical_slots.sql` adds a partial unique index on active rows.
+This prevents two concurrent turns from leaving two current facts in
+the same slot.
 
 Everything in the same transaction as the turn writes, so a reviewer
 querying `/users/{id}/memories` immediately after `/turns` sees the
@@ -209,14 +245,14 @@ returned. `/users/{id}/memories` returns active + inactive rows
 (`ORDER BY active DESC, updated_at DESC`), so the **history** is
 preserved per the API contract.
 
-**Coverage and limits.** Key-based supersession is deterministic and
-cheap. It handles location, employment, pet, and persistent
-preferences cleanly. Opinion arcs (`I love TS` → `TS generics annoy
-me` → `TS for big projects`) are stored under a single
-`opinion.typescript` key, so the chain shows the trajectory but the
-v1 implementation does not synthesise an "evolved" prose summary —
-the current opinion wins. Documented as a tradeoff against an LLM
-judge that adds latency and model-cost variance.
+**Coverage and limits.** Slot-based supersession is deterministic and
+cheap. It handles location, employment, diet/allergy, beverage, and
+persistent preferences cleanly. Multi-entity facts such as two pets
+intentionally keep their original key namespace so they do not collapse
+onto one row. Opinion arcs (`I love TS` → `TS generics annoy me` →
+`TS for big projects`) share a topic slot, so the chain shows the
+trajectory, but the service does not synthesise an "evolved" prose
+summary — the current opinion wins.
 
 ## Tradeoffs
 
@@ -224,7 +260,7 @@ judge that adds latency and model-cost variance.
 |---|---|
 | One backing store, one transaction, no eventual consistency | LLM reranker / query rewriting / multi-hop graph traversal |
 | Synchronous extraction inside `/turns` (60 s budget) | Throughput on bursts — `max_retries=0` on the hot path means a 429 returns zero memories rather than retrying |
-| Deterministic `(user_id, key)` supersession | LLM-judge contradiction detection — heavier, less predictable |
+| Deterministic `(user_id, slot)` supersession | LLM-judge contradiction detection — heavier, less predictable |
 | query-aware fact ranking under tight budget | LLM reranker over the fused conversation candidate pool — extra latency we don't yet have evidence the eval rewards |
 | Original prompt, original schema, single Python file per concern | Bigger framework conveniences (no Celery / Kafka / queue) |
 
@@ -238,6 +274,11 @@ judge that adds latency and model-cost variance.
   `turns.metadata.extraction_error`. `/admin/turn_index` and
   `/admin/run_fixture` expose `extraction_failures` counts +
   `extraction_error_modes` breakdown.
+- **Embedding outage on `/turns`** — if extraction produced memories,
+  the service still returns 201 and persists `turns`, raw
+  `turn_messages`, and typed memories with `turns.metadata.embed_error`.
+  `documents`/`embeddings` for that turn are skipped until a future
+  backfill; recall can still use the structured facts.
 - **OpenAI auth bug (bad key)** — `AuthenticationError` is re-raised
   so `/turns` returns 5xx instead of silently producing zero memories.
 - **DB down** — pool acquisition raises, FastAPI exception middleware
@@ -302,11 +343,11 @@ Or click **Run fixture** in card 5 of the inspection UI. **v1** has 7
 probes (6 positive + 1 noise) over 3 conversations
 (fix-berlin / fix-pet / fix-diet); current run reports
 `recall@1=6/6, recall@3=6/6, noise=1/1, mean=0.356, extraction_failures=0/5`.
-**v2** has 8 probes covering categories — multi-hop linkage,
+**v2** has 9 probes covering categories — multi-hop linkage,
 keyword-anchored vs distractor, tight-budget priority assembly,
 supersession arcs (employer + opinion), adversarial noise, implicit
 fact extraction; current run reports `multihop@1=1/1, facts=6/6,
-forbidden_violations=0, supersession=1/1, noise=1/1, mean=0.450`.
+forbidden_violations=0, supersession=1/1, noise=2/2, mean=0.450`.
 
 ## Repo layout
 
@@ -327,7 +368,9 @@ memory-service/
 │                                005_bm25_hybrid, 006_memory_documents,
 │                                007_canonical_slots
 ├── fixtures/recall/            # v1 (easy floor) + v2 (stress probes)
-├── tests/contract/            # shape tests + required tests
+├── tests/
+│   ├── unit/                  # offline pure-helper tests
+│   └── contract/              # shape tests + required tests
 ├── docker-compose.yml         # db + app, named volume rag-db-data
 ├── Dockerfile
 ├── .env.example
