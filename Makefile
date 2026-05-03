@@ -7,10 +7,10 @@ help:
 	@echo "  logs      - tail app logs"
 	@echo "  build     - docker compose build"
 	@echo "  smoke     - manual smoke against http://localhost:8080"
-	@echo "  test      - pytest (skips e2e by default)"
-	@echo "  test-e2e  - pytest including live-stack tests (requires up)"
-	@echo "  fmt       - ruff format"
-	@echo "  lint      - ruff check"
+	@echo "  test      - uv-run pytest (skips e2e by default)"
+	@echo "  test-e2e  - uv-run pytest including live-stack tests (requires up)"
+	@echo "  fmt       - ruff format src tests"
+	@echo "  lint      - ruff check src tests"
 	@echo "  clean     - remove postgres volume (DESTROYS DATA)"
 
 up:
@@ -29,16 +29,16 @@ smoke:
 	@bash scripts/smoke.sh
 
 test:
-	pytest tests
+	PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --extra dev pytest -p pytest_asyncio.plugin tests
 
 test-e2e:
-	RAG_E2E=1 pytest tests
+	PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 RAG_E2E=1 uv run --extra dev pytest -p pytest_asyncio.plugin tests
 
 fmt:
-	ruff format app tests
+	uv run --extra dev ruff format src tests
 
 lint:
-	ruff check app tests
+	uv run --extra dev ruff check src tests
 
 clean:
 	docker compose down -v
