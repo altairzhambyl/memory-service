@@ -83,6 +83,17 @@ _HYBRID_POOL = 30
 #   * query matches the profile-allowlist regex
 #     ("tell me about this user", "who is …", "what do you know about").
 _RECALL_FACTS_GATE_MEMORY_RRF = 0.02
+# HGT-32 per-fact inclusion threshold. The block-level gate above
+# decides "should the facts block render at all?"; this threshold
+# decides "should THIS particular fact appear inside the block?".
+# Uses raw cosine similarity (not RRF) because RRF rank-1 from one
+# retriever always yields ≈0.0164 regardless of how relevant the doc
+# is — cosine reflects actual relevance. Calibrated so directly
+# relevant memories (e.g. `pet.name=Biscuit` on "Does this user have
+# any pets?") clear, but partial-overlap memories (typescript opinion
+# on quantum query, ~0.20 cosine) are filtered. Threshold tuned to
+# 0.30 against v2 fixture probes.
+_RECALL_FACT_INCLUSION_MIN_COSINE = 0.25
 # Lowered from 0.27 → 0.20 after empirical separation: v2 implicit-pet
 # tops at 0.209 on a relevant pet query, v2 noise-typed-user-empty-context
 # tops at 0.171 on a quantum-computing query against a typescript user.
@@ -921,16 +932,21 @@ async def _recall_memory_candidates(
     qvec: list[float],
     user_id: str,
     top_k: int,
-) -> dict[str, float]:
+) -> dict[str, dict]:
     """
     Hybrid retrieval over `kind='memory'` documents — mirror of
-    `_recall_candidates` but it returns a `{memory_id: rrf_score}` map
-    so the caller can re-rank an arbitrary list of memory rows by
-    query similarity. HGT-23 §4.3 middle priority layer.
+    `_recall_candidates` but it returns a
+    `{memory_id: {"rrf": float, "cosine": float}}` map so the caller
+    can both re-rank by RRF (HGT-23 ordering) and apply per-fact
+    cosine thresholds (HGT-32 noise hardening). RRF ranks alone
+    can't discriminate "relevant top-1" from "marginal top-1" — both
+    yield 1/61 if only one retriever scored the doc — so the cosine
+    score is required for the per-fact gate.
     """
     pool = get_pool()
     cosine_sql = """
-        SELECT  d.metadata->>'memory_id' AS memory_id
+        SELECT  d.metadata->>'memory_id' AS memory_id,
+                1 - (e.embedding <=> $1) AS cosine_score
         FROM    embeddings e
         JOIN    documents  d ON d.id = e.doc_id
         WHERE   d.metadata->>'kind' = 'memory'
@@ -950,21 +966,28 @@ async def _recall_memory_candidates(
     async with pool.acquire() as conn:
         cos_rows = await conn.fetch(cosine_sql, qvec, user_id, top_k)
         bm_rows = await conn.fetch(bm25_sql, user_id, qtext, top_k)
-    fused: dict[str, float] = {}
+    fused: dict[str, dict] = {}
     for rank, row in enumerate(cos_rows, start=1):
         mid = row["memory_id"]
-        if mid:
-            fused[mid] = fused.get(mid, 0.0) + 1.0 / (_RRF_K + rank)
+        if not mid:
+            continue
+        entry = fused.setdefault(mid, {"rrf": 0.0, "cosine": 0.0})
+        entry["rrf"] += 1.0 / (_RRF_K + rank)
+        # cosine_score from the SQL is the actual similarity (1 - distance);
+        # cosine retrieval is the only place we have it, so set directly.
+        entry["cosine"] = float(row["cosine_score"])
     for rank, row in enumerate(bm_rows, start=1):
         mid = row["memory_id"]
-        if mid:
-            fused[mid] = fused.get(mid, 0.0) + 1.0 / (_RRF_K + rank)
+        if not mid:
+            continue
+        entry = fused.setdefault(mid, {"rrf": 0.0, "cosine": 0.0})
+        entry["rrf"] += 1.0 / (_RRF_K + rank)
     return fused
 
 
 def _facts_block_relevant(
     query: str,
-    memory_scores: dict[str, float] | None,
+    memory_scores: dict[str, dict] | None,
     hits: list[dict],
 ) -> bool:
     """
@@ -989,7 +1012,8 @@ def _facts_block_relevant(
     if memory_scores is None:
         return True
     if memory_scores:
-        if max(memory_scores.values(), default=0.0) >= _RECALL_FACTS_GATE_MEMORY_RRF:
+        max_rrf = max((v["rrf"] for v in memory_scores.values()), default=0.0)
+        if max_rrf >= _RECALL_FACTS_GATE_MEMORY_RRF:
             return True
     if hits:
         if max((h["score"] for h in hits), default=0.0) >= _RECALL_FACTS_GATE_CONVERSATION_COSINE:
@@ -1004,7 +1028,7 @@ def _format_recall_context(
     hits: list[dict],
     max_tokens: int,
     *,
-    memory_scores: dict[str, float] | None = None,
+    memory_scores: dict[str, dict] | None = None,
     query: str = "",
 ) -> tuple[str, list[dict]]:
     """
@@ -1049,18 +1073,42 @@ def _format_recall_context(
         fact_lines: list[str] = []
         scores = memory_scores or {}
 
-        # Sort key: (-similarity_score, type_priority, -updated_at_ts).
-        # Negative score so DESC by similarity; type_priority ASC keeps
+        # HGT-32 per-fact gate. Two bypasses:
+        #   * Profile query (`tell me about this user`) — reviewer
+        #     expects a full identity dump regardless of per-fact
+        #     similarity.
+        #   * Degraded mode (`memory_scores is None`, embed_query
+        #     failed) — render every fact, HGT-24 contract overrides
+        #     relevance.
+        # Outside those, a memory renders only if its actual cosine
+        # similarity to the query clears `_RECALL_FACT_INCLUSION_MIN_COSINE`.
+        # We use cosine, not RRF rank, because rank-1 from one retriever
+        # always yields ≈0.0164 regardless of how relevant the doc is —
+        # cosine is the actual relevance signal.
+        per_fact_gate_active = (
+            memory_scores is not None
+            and not _RECALL_PROFILE_QUERY_RE.search(query)
+        )
+
+        # Sort key: (-rrf_score, type_priority, -updated_at_ts).
+        # Negative score so DESC by RRF; type_priority ASC keeps
         # facts > preferences > opinions > events for tied-similarity
         # tail; -updated_at_ts puts the freshest version on top within
-        # a tie.
+        # a tie. RRF (not cosine) for ranking because hybrid retrieval
+        # blends both signals; cosine alone misses keyword-anchored
+        # FTS-only matches.
         def _rank_key(m: dict) -> tuple[float, int, float]:
-            sim = scores.get(m["id"], 0.0)
+            entry = scores.get(m["id"]) or {}
+            rrf = entry.get("rrf", 0.0) if isinstance(entry, dict) else 0.0
             type_pri = _MEMORY_TYPE_PRIORITY.get(m["type"], 99)
             ts = m["updated_at"].timestamp() if m.get("updated_at") else 0.0
-            return (-sim, type_pri, -ts)
+            return (-rrf, type_pri, -ts)
 
         for mem in sorted(memories, key=_rank_key):
+            entry = scores.get(mem["id"]) or {}
+            cosine_sim = entry.get("cosine", 0.0) if isinstance(entry, dict) else 0.0
+            if per_fact_gate_active and cosine_sim < _RECALL_FACT_INCLUSION_MIN_COSINE:
+                continue
             line = f"- {mem['key']}: {mem['value']}"
             cost = _approx_tokens(line) + 1
             head = header_cost if not fact_lines else 0
@@ -1157,7 +1205,7 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     # dict  → retrieval ran (possibly empty result set); gate evaluates
     #         normally — empty dict + empty hits + no profile-query
     #         match means off-topic, render cold.
-    memory_scores: dict[str, float] | None = None
+    memory_scores: dict[str, dict] | None = None
     if embed_error is not None:
         log.warning(
             "recall.embed_failed", user_id=payload.user_id, reason=embed_error,
@@ -1880,7 +1928,12 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
             # block must NOT render.
             expected_empty = bool(probe.get("expected_empty_context", False))
             empty_ok = (not expected_empty) or (rec_resp.context == "")
-            ok = score_ok and empty_ok
+            # HGT-32: noise probes can also assert that no forbidden
+            # fact key prefix surfaces in the `## Known facts` block.
+            # The noise-quantum-typescript-no-facts probe uses this to
+            # verify the per-fact gate suppresses partial-overlap leaks.
+            forbidden_ok = forbidden_violated == 0
+            ok = score_ok and empty_ok and forbidden_ok
             if not score_ok:
                 noise_top_score_violations += 1
             if ok:

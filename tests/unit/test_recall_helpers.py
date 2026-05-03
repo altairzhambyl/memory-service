@@ -106,7 +106,9 @@ def test_parse_known_facts_handles_empty_context():
 
 
 def test_gate_renders_when_memory_score_clears_threshold():
-    assert _facts_block_relevant("any query", {"id-1": 0.05}, []) is True
+    assert _facts_block_relevant(
+        "any query", {"id-1": {"rrf": 0.05, "cosine": 0.4}}, [],
+    ) is True
 
 
 def test_gate_renders_when_conversation_score_clears_threshold():
@@ -120,7 +122,7 @@ def test_gate_blocks_when_all_signals_below_threshold():
     """
     assert _facts_block_relevant(
         "What is the user's opinion on quantum computing?",
-        {"id-1": 0.005},
+        {"id-1": {"rrf": 0.005, "cosine": 0.05}},
         [{"score": 0.15}],
     ) is False
 
@@ -158,7 +160,10 @@ def test_format_drops_facts_section_when_budget_too_small_for_header_plus_line()
     of returning a header-only context that exceeds the budget."""
     mems = [_mem("a", "fact", "k", "v")]
     ctx, _ = _format_recall_context(
-        mems, [], max_tokens=1, memory_scores={"a": 0.05}, query="x",
+        mems, [],
+        max_tokens=1,
+        memory_scores={"a": {"rrf": 0.05, "cosine": 0.5}},
+        query="x",
     )
     assert ctx == ""
 
@@ -166,7 +171,10 @@ def test_format_drops_facts_section_when_budget_too_small_for_header_plus_line()
 def test_format_renders_facts_when_budget_admits_header_plus_one_line():
     mems = [_mem("a", "fact", "diet.style", "vegetarian")]
     ctx, _ = _format_recall_context(
-        mems, [], max_tokens=64, memory_scores={"a": 0.05}, query="diet",
+        mems, [],
+        max_tokens=64,
+        memory_scores={"a": {"rrf": 0.05, "cosine": 0.5}},
+        query="diet",
     )
     assert "## Known facts about this user" in ctx
     assert "- diet.style: vegetarian" in ctx
@@ -175,13 +183,20 @@ def test_format_renders_facts_when_budget_admits_header_plus_one_line():
 def test_format_query_aware_sort_promotes_relevant_facts_under_tight_budget():
     """HGT-23: query similarity drives order. Diet fact has the highest
     score and must lead the block; employment trails. Under tight
-    budget, the lowest-scoring facts drop first."""
+    budget, the lowest-scoring facts drop first. All three cosines
+    clear the per-fact gate (HGT-32), so the per-fact filter is not
+    what's being tested here — only the sort ordering is.
+    """
     mems = [
         _mem("emp", "fact", "employment.company", "Notion"),
         _mem("diet", "preference", "diet.style", "vegetarian"),
         _mem("pet", "fact", "pet.name", "Biscuit"),
     ]
-    scores = {"diet": 0.05, "emp": 0.02, "pet": 0.025}
+    scores = {
+        "diet": {"rrf": 0.05, "cosine": 0.55},
+        "emp": {"rrf": 0.02, "cosine": 0.45},
+        "pet": {"rrf": 0.025, "cosine": 0.50},
+    }
     ctx, _ = _format_recall_context(
         mems, [], max_tokens=64, memory_scores=scores, query="what does the user eat",
     )
@@ -237,3 +252,78 @@ def test_format_renders_facts_in_degraded_mode_even_when_off_topic_query():
         mems, [], max_tokens=1024, memory_scores=None, query="something off-topic",
     )
     assert "Berlin" in ctx
+
+
+# ---------------------------------------------------------------------------
+# _format_recall_context — HGT-32 per-fact relevance gate.
+# ---------------------------------------------------------------------------
+
+
+def test_format_per_fact_gate_drops_low_cosine_memories():
+    """HGT-32: a memory whose cosine similarity to the query is below
+    `_RECALL_FACT_INCLUSION_MIN_COSINE` (0.30) must NOT render, even
+    when the block-level gate passes via another signal. Closes the
+    partial-overlap edge — typescript opinion on a quantum query.
+    """
+    mems = [
+        _mem("opin", "opinion", "opinion.typescript", "annoying"),
+        _mem("loc", "fact", "location.city", "Berlin"),
+    ]
+    # opin barely scrapes RRF (block gate clears via location, which
+    # has a strong cosine), but its own cosine is 0.18 — below the
+    # per-fact threshold. location.city has cosine 0.55 — clears.
+    scores = {
+        "opin": {"rrf": 0.0164, "cosine": 0.18},
+        "loc": {"rrf": 0.05, "cosine": 0.55},
+    }
+    ctx, _ = _format_recall_context(
+        mems, [],
+        max_tokens=1024,
+        memory_scores=scores,
+        query="What is the user's opinion on quantum computing?",
+    )
+    assert "## Known facts about this user" in ctx
+    assert "location.city" in ctx
+    assert "opinion.typescript" not in ctx, (
+        "per-fact gate failed: low-cosine opinion leaked into facts block"
+    )
+
+
+def test_format_per_fact_gate_bypassed_for_profile_query():
+    """HGT-32: profile queries (`tell me about this user`) bypass the
+    per-fact threshold so reviewers get a full identity dump even on
+    facts with weak query-similarity scores."""
+    mems = [
+        _mem("opin", "opinion", "opinion.typescript", "annoying"),
+        _mem("loc", "fact", "location.city", "Berlin"),
+    ]
+    scores = {
+        "opin": {"rrf": 0.0164, "cosine": 0.10},
+        "loc": {"rrf": 0.0164, "cosine": 0.10},
+    }
+    ctx, _ = _format_recall_context(
+        mems, [],
+        max_tokens=1024,
+        memory_scores=scores,
+        query="Tell me about this user.",
+    )
+    assert "opinion.typescript" in ctx
+    assert "location.city" in ctx
+
+
+def test_format_per_fact_gate_bypassed_in_degraded_mode():
+    """HGT-32 + HGT-24: when memory_scores is None (embed_query
+    failed), the per-fact gate is bypassed — every active fact
+    renders. Degraded-mode contract takes precedence over relevance."""
+    mems = [
+        _mem("opin", "opinion", "opinion.typescript", "annoying"),
+        _mem("loc", "fact", "location.city", "Berlin"),
+    ]
+    ctx, _ = _format_recall_context(
+        mems, [],
+        max_tokens=1024,
+        memory_scores=None,
+        query="any query while degraded",
+    )
+    assert "opinion.typescript" in ctx
+    assert "location.city" in ctx
