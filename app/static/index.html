@@ -1181,10 +1181,13 @@
     function s3RenderIndex(data) {
       const docColor = data.documents_count === data.embeddings_count ? "" : "warn";
       const failClass = data.extraction_failures > 0 ? "warn" : "";
+      const embedFailClass = (data.embed_failures || 0) > 0 ? "warn" : "";
       s3.ixCounts.innerHTML =
         `<span class="s3-pill"><span>documents: </span><strong>${data.documents_count}</strong></span>` +
         `<span class="s3-pill ${docColor}"><span>embeddings: </span><strong>${data.embeddings_count}</strong></span>` +
+        `<span class="s3-pill"><span>memory docs: </span><strong>${data.memory_document_count || 0}</strong></span>` +
         `<span class="s3-pill ${failClass}"><span>extraction failures: </span><strong>${data.extraction_failures}</strong></span>` +
+        `<span class="s3-pill ${embedFailClass}"><span>embed failures: </span><strong>${data.embed_failures || 0}</strong></span>` +
         `<span class="s3-pill"><span>shown: </span><strong>${data.rows.length}</strong></span>`;
 
       if (!data.rows.length) {

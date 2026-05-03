@@ -64,6 +64,11 @@ _CHARS_PER_TOKEN = 4
 # Hard cap on the candidate pool we pull before token-budget trimming.
 # Keeps the JOIN bounded; HNSW handles ranking.
 _RECALL_TOPK = 10
+# Memory-side retrieval top-k for HGT-23 query-aware fact ranking. We
+# pull more memory IDs than turn-message hits because the budget loop
+# in `_format_recall_context` may surface many facts on tight queries
+# and we want non-zero similarity scores on as many of them as possible.
+_MEMORY_RECALL_TOPK = 50
 # Per-retriever candidate pool for the hybrid fuse. Each retriever (cosine
 # and BM25) returns up to this many docs; RRF merges and re-ranks them.
 _HYBRID_POOL = 30
@@ -467,19 +472,34 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
     turn_id = str(uuid.uuid4())
     settings = get_settings()
 
-    contents = [msg.content for msg in payload.messages]
-    # max_retries=0 on the hot path: 3 retry windows × 30s would blow the
-    # §3 60s /turns budget on a 429 burst. /ingest and /recall keep the
-    # client default (2) since they don't have the same budget pressure.
-    vectors, embed_error = await embed_documents(contents, max_retries=0)
-
-    # Anonymous turns can't write memories (table requires user_id NOT NULL),
-    # so skip the LLM call entirely — saves cost and avoids a no-op write path.
+    # HGT-23: extract FIRST so memory texts can be added to the same
+    # embed batch as turn-message texts. One OpenAI roundtrip covers
+    # both layers, keeping the §3 60 s /turns budget intact.
     if payload.user_id is None:
+        # Anonymous turns can't write memories (table requires user_id
+        # NOT NULL), so skip the LLM call entirely — saves cost and
+        # avoids a no-op write path.
         extracted: list[dict] = []
         extraction_error: str | None = None
     else:
         extracted, extraction_error = await extract_memories_from_turn(payload.messages)
+
+    # Pre-assign new memory ids before the embed call so the kind='memory'
+    # doc_id (`mem:{id}`) is stable across the batch — vector and provenance
+    # share the same uuid.
+    new_memory_ids = [str(uuid.uuid4()) for _ in extracted]
+    memory_texts = [f"{m['key']}: {m['value']}" for m in extracted]
+
+    turn_msg_texts = [msg.content for msg in payload.messages]
+    embed_inputs = turn_msg_texts + memory_texts
+
+    # max_retries=0 on the hot path: 3 retry windows × 30s would blow the
+    # §3 60s /turns budget on a 429 burst. /ingest and /recall keep the
+    # client default (2) since they don't have the same budget pressure.
+    vectors, embed_error = await embed_documents(embed_inputs, max_retries=0)
+    n_turns = len(turn_msg_texts)
+    turn_vectors = vectors[:n_turns] if embed_error is None else []
+    memory_vectors = vectors[n_turns:] if embed_error is None else []
 
     # §5 / HGT-24 graceful upstream-failure policy:
     #   * both ok           → full commit (today's path).
@@ -529,7 +549,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             # to /recall anyway, so persisting them costs storage with no
             # retrieval payoff. A future backfill path can re-ingest.
             for idx, (msg, vec) in enumerate(
-                zip(payload.messages, vectors, strict=True)
+                zip(payload.messages, turn_vectors, strict=True)
             ):
                 await conn.execute(
                     """
@@ -564,7 +584,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                     doc_id, vec, settings.embedding_model,
                 )
 
-        for mem in extracted:
+        for mem_idx, mem in enumerate(extracted):
             # §4.1 supersession on (user_id, key). Three cases:
             #   1. No prior active row     → plain insert.
             #   2. Same key, same value    → idempotent: refresh
@@ -573,7 +593,10 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             #      when the user re-states a fact across turns.
             #   3. Same key, new value     → insert new row with
             #      supersedes=old.id, flip old.active=FALSE.
-            #      Old row stays for /users/{id}/memories history.
+            #      Old row stays for /users/{id}/memories history;
+            #      its kind='memory' document is deleted so /recall
+            #      doesn't re-surface stale facts via the hybrid
+            #      memory retriever (HGT-23).
             prior = await conn.fetchrow(
                 """
                 SELECT id, value
@@ -588,7 +611,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                     prior["id"],
                 )
                 continue
-            new_id = str(uuid.uuid4())
+            new_id = new_memory_ids[mem_idx]
             supersedes = prior["id"] if prior is not None else None
             if prior is not None:
                 await conn.execute(
@@ -598,6 +621,13 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                     WHERE  id = $1
                     """,
                     prior["id"],
+                )
+                # Drop the superseded fact's `kind='memory'` document so
+                # the query-relevant retrieval (HGT-23) never re-surfaces
+                # it. The new active row gets its own mem:{id} doc below.
+                await conn.execute(
+                    "DELETE FROM documents WHERE id = $1",
+                    f"mem:{prior['id']}",
                 )
             await conn.execute(
                 """
@@ -617,6 +647,35 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 turn_id,
                 supersedes,
             )
+            # HGT-23: write the sibling kind='memory' document + embedding
+            # so /recall can rank facts by query similarity. Embed budget
+            # was paid for upfront in the batched embed_documents call.
+            if embed_error is None:
+                mem_doc_id = f"mem:{new_id}"
+                mem_provenance = {
+                    "kind": "memory",
+                    "memory_id": new_id,
+                    "user_id": payload.user_id,
+                    "key": mem["key"],
+                    "type": mem["type"],
+                    "session_id": payload.session_id,
+                    "turn_id": turn_id,
+                    "ts": payload.timestamp.isoformat(),
+                }
+                await conn.execute(
+                    """
+                    INSERT INTO documents (id, text, metadata)
+                    VALUES ($1, $2, $3::jsonb)
+                    """,
+                    mem_doc_id, memory_texts[mem_idx], _to_jsonb(mem_provenance),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO embeddings (doc_id, embedding, model)
+                    VALUES ($1, $2, $3)
+                    """,
+                    mem_doc_id, memory_vectors[mem_idx], settings.embedding_model,
+                )
     return TurnResponse(id=turn_id)
 
 
@@ -722,13 +781,14 @@ async def _fetch_active_memories(user_id: str) -> list[dict]:
     Active typed memories for a user, ordered for §3 `## Known facts`
     rendering: type priority first (fact → preference → opinion → event),
     then most-recently-updated. Plain row dicts, decoupled from the
-    /users/{id}/memories response model.
+    /users/{id}/memories response model. The retrieval-rank join lives
+    in `_format_recall_context` (HGT-23 query-aware ordering).
     """
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT  type, key, value
+            SELECT  id, type, key, value, updated_at
             FROM    memories
             WHERE   user_id = $1 AND active = TRUE
             ORDER BY updated_at DESC, id ASC
@@ -736,24 +796,85 @@ async def _fetch_active_memories(user_id: str) -> list[dict]:
             user_id,
         )
     out = [
-        {"type": r["type"], "key": r["key"], "value": r["value"]}
+        {
+            "id": r["id"],
+            "type": r["type"],
+            "key": r["key"],
+            "value": r["value"],
+            "updated_at": r["updated_at"],
+        }
         for r in rows
     ]
     out.sort(key=lambda m: _MEMORY_TYPE_PRIORITY.get(m["type"], 99))
     return out
 
 
+async def _recall_memory_candidates(
+    qtext: str,
+    qvec: list[float],
+    user_id: str,
+    top_k: int,
+) -> dict[str, float]:
+    """
+    Hybrid retrieval over `kind='memory'` documents — mirror of
+    `_recall_candidates` but it returns a `{memory_id: rrf_score}` map
+    so the caller can re-rank an arbitrary list of memory rows by
+    query similarity. HGT-23 §4.3 middle priority layer.
+    """
+    pool = get_pool()
+    cosine_sql = """
+        SELECT  d.metadata->>'memory_id' AS memory_id
+        FROM    embeddings e
+        JOIN    documents  d ON d.id = e.doc_id
+        WHERE   d.metadata->>'kind' = 'memory'
+          AND   d.metadata->>'user_id' = $2
+        ORDER BY e.embedding <=> $1
+        LIMIT   $3
+    """
+    bm25_sql = """
+        SELECT  d.metadata->>'memory_id' AS memory_id
+        FROM    documents d
+        WHERE   d.metadata->>'kind' = 'memory'
+          AND   d.metadata->>'user_id' = $1
+          AND   d.tsv @@ plainto_tsquery('english', $2)
+        ORDER BY ts_rank_cd(d.tsv, plainto_tsquery('english', $2)) DESC
+        LIMIT   $3
+    """
+    async with pool.acquire() as conn:
+        cos_rows = await conn.fetch(cosine_sql, qvec, user_id, top_k)
+        bm_rows = await conn.fetch(bm25_sql, user_id, qtext, top_k)
+    fused: dict[str, float] = {}
+    for rank, row in enumerate(cos_rows, start=1):
+        mid = row["memory_id"]
+        if mid:
+            fused[mid] = fused.get(mid, 0.0) + 1.0 / (_RRF_K + rank)
+    for rank, row in enumerate(bm_rows, start=1):
+        mid = row["memory_id"]
+        if mid:
+            fused[mid] = fused.get(mid, 0.0) + 1.0 / (_RRF_K + rank)
+    return fused
+
+
 def _format_recall_context(
     memories: list[dict],
     hits: list[dict],
     max_tokens: int,
+    *,
+    memory_scores: dict[str, float] | None = None,
 ) -> tuple[str, list[dict]]:
     """
     Build the §3 `context` string and matched citations under a token
-    budget. §4.3 priority: stable user facts → recent conversation
-    chunks. The `## Known facts about this user` block consumes budget
-    first; whatever budget remains is drained into `## Relevant from
-    recent conversations`.
+    budget. §4.3 priority: stable user facts → query-relevant memories
+    → recent conversation chunks. The `## Known facts about this user`
+    block consumes budget first; whatever budget remains is drained
+    into `## Relevant from recent conversations`.
+
+    HGT-23: when `memory_scores` is supplied (from
+    `_recall_memory_candidates`), facts are re-sorted by query
+    similarity DESC, with `(type_priority, updated_at DESC)` as the
+    tail-sort for memories the retriever didn't surface. Under tight
+    budget the lowest-similarity facts are dropped first, so an
+    irrelevant fact never crowds out a relevant one.
 
     Citations only carry `turn_id` references — memories surface in
     the prose block but are inspectable via /users/{id}/memories so we
@@ -769,12 +890,25 @@ def _format_recall_context(
         facts_header = "## Known facts about this user"
         used += _approx_tokens(facts_header)
         fact_lines: list[str] = []
-        for mem in memories:
+        scores = memory_scores or {}
+        # Sort key: (-similarity_score, type_priority, -updated_at_ts).
+        # Negative score so DESC by similarity; type_priority ASC keeps
+        # facts > preferences > opinions > events for tied-similarity
+        # tail; -updated_at_ts puts the freshest version on top within
+        # a tie.
+        def _rank_key(m: dict) -> tuple[float, int, float]:
+            sim = scores.get(m["id"], 0.0)
+            type_pri = _MEMORY_TYPE_PRIORITY.get(m["type"], 99)
+            ts = m["updated_at"].timestamp() if m.get("updated_at") else 0.0
+            return (-sim, type_pri, -ts)
+
+        for mem in sorted(memories, key=_rank_key):
             line = f"- {mem['key']}: {mem['value']}"
             cost = _approx_tokens(line) + 1
             if used + cost > max_tokens and fact_lines:
                 # §4.3: facts have priority but a runaway memory list
-                # still cannot blow past the budget.
+                # still cannot blow past the budget. Lowest-similarity
+                # facts are dropped first thanks to the sort above.
                 break
             used += cost
             fact_lines.append(line)
@@ -825,11 +959,12 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     2. Query-relevant recent turns — cosine top-k over indexed messages.
 
     §4.3 priority is "stable facts → query-relevant memories → recent
-    context". With §4.1 supersession in place, the memory set is
-    deduplicated by (user_id, key); a dedicated query-relevant-memories
-    layer via embedding similarity over memory rows is a future
-    refinement. Recent-context retrieval is hybrid (cosine + BM25 via
-    RRF) per §10 — see `_recall_candidates`.
+    context". HGT-23 wires the middle layer: each memory row has a
+    sibling `kind='memory'` document, hybrid-ranked by query
+    similarity, used to re-sort the `## Known facts` block so under
+    tight budget the relevant facts survive and irrelevant ones drop
+    first. Recent-context retrieval is hybrid (cosine + FTS via RRF)
+    per §10 — see `_recall_candidates`.
 
     §3 cold semantics: empty store, unknown user, or zero matches → 200
     with `{"context": "", "citations": []}`. Never errors.
@@ -850,17 +985,23 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     memories = await _fetch_active_memories(payload.user_id)
 
     qvec, embed_error = await embed_query(payload.query)
+    memory_scores: dict[str, float] = {}
     if embed_error is not None:
         log.warning(
             "recall.embed_failed", user_id=payload.user_id, reason=embed_error,
         )
         hits: list[dict] = []
     else:
+        memory_scores = await _recall_memory_candidates(
+            payload.query, qvec, payload.user_id, _MEMORY_RECALL_TOPK,
+        )
         hits = await _recall_candidates(
             payload.query, qvec, payload.user_id, payload.session_id, _RECALL_TOPK,
         )
 
-    context, citations = _format_recall_context(memories, hits, payload.max_tokens)
+    context, citations = _format_recall_context(
+        memories, hits, payload.max_tokens, memory_scores=memory_scores,
+    )
     return RecallResponse(
         context=context,
         citations=[Citation(**c) for c in citations],
@@ -981,7 +1122,7 @@ async def delete_section3_session(session_id: str) -> Response:
         await conn.execute(
             """
             DELETE FROM documents
-            WHERE metadata->>'kind' = 'turn_message'
+            WHERE metadata->>'kind' IN ('turn_message', 'memory')
               AND metadata->>'session_id' = $1
             """,
             session_id,
@@ -1002,7 +1143,7 @@ async def delete_section3_user(user_id: str) -> Response:
         await conn.execute(
             """
             DELETE FROM documents
-            WHERE metadata->>'kind' = 'turn_message'
+            WHERE metadata->>'kind' IN ('turn_message', 'memory')
               AND metadata->>'user_id' = $1
             """,
             user_id,
@@ -1041,6 +1182,11 @@ async def admin_turn_index(
         args.append(session_id)
         where.append(f"metadata->>'session_id' = ${len(args)}")
     where_sql = " AND ".join(where)
+    # HGT-23: parallel WHERE for kind='memory' documents — same scope.
+    mem_where = where_sql.replace(
+        "metadata->>'kind' = 'turn_message'",
+        "metadata->>'kind' = 'memory'",
+    )
 
     # Build parallel turns-side WHERE clauses for the failure counts.
     # `documents` rows live under metadata->>'kind' = 'turn_message' but
@@ -1070,6 +1216,10 @@ async def admin_turn_index(
             """,
             *args,
         )
+        memory_docs_count = await conn.fetchval(
+            f"SELECT count(*) FROM documents WHERE {mem_where}",
+            *args,
+        )
         extraction_failures = await conn.fetchval(
             f"SELECT count(*) FROM turns WHERE {extract_where}",
             *turn_scope_args,
@@ -1096,6 +1246,7 @@ async def admin_turn_index(
     return TurnIndexResponse(
         documents_count=int(docs_count or 0),
         embeddings_count=int(embs_count or 0),
+        memory_document_count=int(memory_docs_count or 0),
         extraction_failures=int(extraction_failures or 0),
         embed_failures=int(embed_failures or 0),
         rows=[
@@ -1187,6 +1338,89 @@ async def _count_inactive_rows(
         args = (user_id, f"{key_prefix}%")
     async with pool.acquire() as conn:
         return int(await conn.fetchval(sql, *args) or 0)
+
+
+@router.post("/admin/reembed_memories")
+async def admin_reembed_memories(
+    user_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    """
+    HGT-23 backfill: walk active memories that lack a sibling
+    `kind='memory'` document, batch-embed them, and INSERT the
+    documents/embeddings rows. Idempotent — second run on a clean
+    state returns `processed=0`.
+
+    Operator-driven; runs in the foreground inside the §3 60s budget
+    via internal batching (`limit` caps a single call). Call
+    repeatedly until `processed=0`. Fresh installs do not need this —
+    the new `/turns` code path writes the sibling docs synchronously.
+    """
+    pool = get_pool()
+    where = ["m.active = TRUE",
+             "NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = 'mem:' || m.id)"]
+    args: list[object] = []
+    if user_id is not None:
+        args.append(user_id)
+        where.append(f"m.user_id = ${len(args)}")
+    args.append(limit)
+    where_sql = " AND ".join(where)
+    sql = f"""
+        SELECT  m.id, m.user_id, m.type, m.key, m.value,
+                m.source_session, m.source_turn, m.created_at
+        FROM    memories m
+        WHERE   {where_sql}
+        ORDER BY m.created_at ASC
+        LIMIT   ${len(args)}
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    if not rows:
+        return {"processed": 0, "skipped": 0, "failed": 0, "error": None}
+
+    texts = [f"{r['key']}: {r['value']}" for r in rows]
+    settings = get_settings()
+    vectors, embed_error = await embed_documents(texts)
+    if embed_error is not None:
+        return {
+            "processed": 0,
+            "skipped": 0,
+            "failed": len(rows),
+            "error": embed_error,
+        }
+
+    processed = 0
+    async with pool.acquire() as conn, conn.transaction():
+        for row, vec in zip(rows, vectors, strict=True):
+            mem_doc_id = f"mem:{row['id']}"
+            mem_provenance = {
+                "kind": "memory",
+                "memory_id": row["id"],
+                "user_id": row["user_id"],
+                "key": row["key"],
+                "type": row["type"],
+                "session_id": row["source_session"],
+                "turn_id": row["source_turn"],
+                "ts": row["created_at"].isoformat(),
+            }
+            await conn.execute(
+                """
+                INSERT INTO documents (id, text, metadata)
+                VALUES ($1, $2, $3::jsonb)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                mem_doc_id, f"{row['key']}: {row['value']}", _to_jsonb(mem_provenance),
+            )
+            await conn.execute(
+                """
+                INSERT INTO embeddings (doc_id, embedding, model)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (doc_id) DO NOTHING
+                """,
+                mem_doc_id, vec, settings.embedding_model,
+            )
+            processed += 1
+    return {"processed": processed, "skipped": 0, "failed": 0, "error": None}
 
 
 @router.post("/admin/inject_embed_failure")
