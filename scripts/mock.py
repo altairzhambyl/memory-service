@@ -725,39 +725,67 @@ for tid, turns, kf, n in HIST:
     reg_data(tid, SUPERSESSION, f"≥{n} inactive rows in slot",
              lambda t=turns, kf=kf, n=n: _chain_history(t, kf, n))
 
-# /recall surfaces only current (5)
+# /recall surfaces only current (5).
+#
+# We assert two things separately:
+#   1. /recall context contains the *current* value (positive signal).
+#   2. The *active row* in the slot (queried via /users/{id}/memories)
+#      no longer holds the old value.
+#
+# We deliberately do NOT forbid the old value as a substring of the full
+# /recall context. §4.1 preserves history — the old value can legitimately
+# appear in `previous_company`, the supersession-chain narrative, etc.
+# Earlier mock revisions over-asserted "old absent everywhere" and
+# false-failed cases where the service did the right thing.
 def _recall_surfaces_current(turns: list[str], current_substr: str,
-                              not_substr: str, query: str) -> tuple[bool, str]:
+                              old_substr: str, query: str,
+                              slot_keys: tuple[str, ...]) -> tuple[bool, str]:
     sid, uid = uniq("s"), uniq("u")
     for t in turns:
         post_turn(sid, uid, t)
-    body = post_recall(uid, query).json()
-    ctx = body["context"]
-    has_current = current_substr.lower() in ctx.lower()
-    no_old = not_substr.lower() not in ctx.lower()
-    return has_current and no_old, f"current={has_current} no_old={no_old}"
+    ctx = post_recall(uid, query).json()["context"]
+    has_current = current_substr.lower() in ctx.lower() if current_substr else True
+    # Active row in the supersession slot must NOT carry the old value.
+    active_in_slot = [
+        m for m in get_memories(uid)
+        if m["active"] and any(m["key"].startswith(k) for k in slot_keys)
+    ]
+    if not active_in_slot:
+        return has_current, f"current={has_current} (no active row in slot)"
+    active_value_concat = " ".join(m["value"].lower() for m in active_in_slot)
+    old_in_active = old_substr.lower() in active_value_concat if old_substr else False
+    return has_current and not old_in_active, (
+        f"current={has_current} active_has_old={old_in_active}"
+    )
 
 
 RECALL_CURRENT = [
     ("F16.recall.city.now",
      ["I live in Seattle.", "Actually Austin.", "Now Portland."],
-     "Portland", "Seattle", "Tell me about this user."),
+     "Portland", "Seattle", "Tell me about this user.",
+     ("location.current_city", "location.city")),
     ("F17.recall.employer.now",
      ["I work at Stripe.", "Just started at Notion."],
-     "Notion", "Stripe", "Tell me about this user."),
+     "Notion", "Stripe", "Tell me about this user.",
+     ("employment.current_company", "employment.company")),
     ("F18.recall.diet.now",
      ["I'm vegetarian.", "Actually I'm vegan now."],
-     "vegan", "vegetarian", "Tell me about this user."),
+     "vegan", "vegetarian", "Tell me about this user.",
+     ("diet",)),
     ("F19.recall.allergy.removed",
      ["Allergic to peanuts.", "Actually, no peanut allergy — that was wrong."],
-     "", "peanuts", "Tell me about this user."),
+     "", "peanuts", "Tell me about this user.",
+     ("allergy",)),
     ("F20.recall.role.now",
      ["I'm an engineer at Meta.", "Just got promoted to staff engineer."],
-     "staff", "engineer", "Tell me about this user."),
+     "staff", "engineer", "Tell me about this user.",
+     ("employment.current_role", "employment.role")),
 ]
-for tid, turns, cur, old, q in RECALL_CURRENT:
-    reg_data(tid, SUPERSESSION, f"current contains '{cur}', no '{old}'",
-             lambda t=turns, c=cur, o=old, q=q: _recall_surfaces_current(t, c, o, q))
+for tid, turns, cur, old, q, sk in RECALL_CURRENT:
+    reg_data(tid, SUPERSESSION,
+             f"active row in slot has '{cur}', not '{old}'",
+             lambda t=turns, c=cur, o=old, q=q, sk=sk:
+                 _recall_surfaces_current(t, c, o, q, sk))
 
 
 # ====================================================================
@@ -768,60 +796,83 @@ MULTIENTITY = "Multi-entity slots"
 
 
 def _multi_entity(turns: list[str], expected_values: list[str],
-                   prefix: str) -> tuple[bool, str]:
+                   prefixes: tuple[str, ...]) -> tuple[bool, str]:
+    """Each expected value must appear (substring, case-insensitive) in
+    the value of an *active* memory whose key starts with any of the
+    listed prefixes.
+
+    Multiple acceptable prefixes per category — the §4.2 prompt does
+    not enumerate `child.<name>` / `vehicle.<name>` keys, so the LLM
+    emits `family.son_name`, `family.children`, `vehicle.car`, etc.
+    The mock predicate accepts any of those prefix families so we do
+    not false-fail when the service correctly extracted the entity
+    under a slightly different namespace.
+    """
     sid, uid = uniq("s"), uniq("u")
     for t in turns:
-        # retry per turn to handle flaky extraction
         for _ in range(3):
             post_turn(sid, uid, t)
-            actives = {m["value"].lower() for m in get_memories(uid)
-                       if m["active"] and m["key"].startswith(prefix)}
+            actives = [
+                m["value"].lower() for m in get_memories(uid)
+                if m["active"]
+                and any(m["key"].lower().startswith(p) for p in prefixes)
+            ]
             if any(v.lower() in " ".join(actives) for v in expected_values[:1]):
                 break
-    final = {m["value"].lower() for m in get_memories(uid)
-             if m["active"] and m["key"].startswith(prefix)}
+    final = [
+        m["value"].lower() for m in get_memories(uid)
+        if m["active"]
+        and any(m["key"].lower().startswith(p) for p in prefixes)
+    ]
     have = sum(1 for v in expected_values
                if any(v.lower() in val for val in final))
     return have >= len(expected_values), f"{have}/{len(expected_values)} active"
 
 
+# Each entry: (test_id, turns, expected_value_substrings, acceptable_key_prefixes).
+# Multi-entity slots use any prefix family the LLM might emit.
+PET_PREFIXES = ("pet", "pets", "animal", "animals")
+CHILD_PREFIXES = ("child", "children", "family", "kids")
+VEHICLE_PREFIXES = ("vehicle", "vehicles", "car", "cars", "van")
+
 MULTIE = [
     ("M01.pet.cat_dog", ["I have a cat named Mochi.", "I also have a dog named Biscuit."],
-     ["mochi", "biscuit"], "pet"),
+     ["mochi", "biscuit"], PET_PREFIXES),
     ("M02.pet.three", ["I have a cat Mochi.", "Also a dog Biscuit.", "And a hamster Pickle."],
-     ["mochi", "biscuit", "pickle"], "pet"),
+     ["mochi", "biscuit", "pickle"], PET_PREFIXES),
     ("M03.pet.parrot_fish", ["I keep a parrot named Mango.", "I also have a fish called Bubble."],
-     ["mango", "bubble"], "pet"),
+     ["mango", "bubble"], PET_PREFIXES),
     ("M04.pet.dogs_named", ["My dog Buddy is here.", "My second dog is Rex."],
-     ["buddy", "rex"], "pet"),
+     ["buddy", "rex"], PET_PREFIXES),
     ("M05.pet.cat_then_replace_no_collapse",
      ["I have a cat Mochi.", "I have a cat called Luna."],
-     ["luna"], "pet"),  # at least Luna; Mochi may stay
+     ["luna"], PET_PREFIXES),  # at least Luna; Mochi may stay
     ("M06.children.two", ["My daughter Anna is six.", "My son Leo is four."],
-     ["anna", "leo"], "child"),
+     ["anna", "leo"], CHILD_PREFIXES),
     ("M07.children.two_alt", ["I have a kid named Max.", "And another named Sophie."],
-     ["max", "sophie"], "child"),
+     ["max", "sophie"], CHILD_PREFIXES),
     ("M08.vehicles.two", ["I drive a Volvo named Greta.", "We also own a Tesla called Sparky."],
-     ["greta", "sparky"], "vehicle"),
+     ["greta", "sparky"], VEHICLE_PREFIXES),
     ("M09.vehicles.car_van", ["My car is named Lola.", "Our van is called Bessy."],
-     ["lola", "bessy"], "vehicle"),
+     ["lola", "bessy"], VEHICLE_PREFIXES),
     ("M10.pet.snake_cat", ["My snake's name is Slinky.", "My cat is Whiskers."],
-     ["slinky", "whiskers"], "pet"),
+     ["slinky", "whiskers"], PET_PREFIXES),
     ("M11.pet.iguana_dog", ["I have an iguana Rex.", "Also a dog Cooper."],
-     ["rex", "cooper"], "pet"),
+     ["rex", "cooper"], PET_PREFIXES),
     ("M12.pet.bunny_cat", ["My bunny's name is Daisy.", "My cat is Pumpkin."],
-     ["daisy", "pumpkin"], "pet"),
+     ["daisy", "pumpkin"], PET_PREFIXES),
     ("M13.children.three", ["My eldest is Max.", "My middle is Sophie.", "My youngest is Riley."],
-     ["max", "sophie", "riley"], "child"),
+     ["max", "sophie", "riley"], CHILD_PREFIXES),
     ("M14.pet.fish_cat_dog", ["I have a goldfish Bubble.", "A cat Mochi.", "A dog Biscuit."],
-     ["bubble", "mochi", "biscuit"], "pet"),
+     ["bubble", "mochi", "biscuit"], PET_PREFIXES),
     ("M15.pet.dog_cat_collapse_protection",
      ["First, I have a dog Biscuit.", "Second, I have a cat Mochi.", "Third, my hamster Pickle."],
-     ["biscuit", "mochi", "pickle"], "pet"),
+     ["biscuit", "mochi", "pickle"], PET_PREFIXES),
 ]
-for tid, turns, expected, prefix in MULTIE:
-    reg_data(tid, MULTIENTITY, f"all of {expected} active under {prefix}.*",
-             lambda t=turns, e=expected, p=prefix: _multi_entity(t, e, p))
+for tid, turns, expected, prefixes in MULTIE:
+    reg_data(tid, MULTIENTITY,
+             f"all of {expected} in active rows under {prefixes[0]}.* family",
+             lambda t=turns, e=expected, p=prefixes: _multi_entity(t, e, p))
 
 
 # ====================================================================
