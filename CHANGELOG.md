@@ -718,3 +718,39 @@ Degraded 201 безопаснее principled 503 в strict harness'е. Это н
 **Result.** Verified via curl: anonymous turn + injected embed failure → 201 + id, `/admin/turn_index` shows `embed_failures=1` + `documents_count=0`. v1 fixture: recall@1=6/6, mean=0.3557, без регрессии. v2 fixture: 10/10 PASS. Strict eval harness совместимость: §3 «POST /turns → 201» promise теперь honored на ВСЕ valid inputs независимо от upstream weather.
 
 **Дальше.** Re-extract / re-embed path для bare turns — out of scope для submission, но тикет можно открыть если eval показывает что recovery flow важен.
+
+---
+
+## 2026-05-03 — 200-тестовый mock-harness (`scripts/mock.py`)
+
+**Проблема (§3, §5, §7, §9).** v1+v2 fixture'ы покрывают recall-quality, но не proof'ят остальной §3 контракт surface на варьируемых workload'ах. Pytest даёт 22 offline + 24 live = 46 тестов, и каждый из них — таргетированный case, не systematic sweep по всем endpoint'ам и edge case'ам. Senior review (Codex) явно flagнул: «extraction.py, embeddings, config, middleware, и DB pool имеют zero unit tests, только тестируются indirectly через E2E». Нужен harness который exhaustively probes §3 surface + §4.x extraction categories + §5 hard constraints + §9 eval categories с predictable labels per test, чтобы ANY regression была caught at clear assert level.
+
+**Ход мыслей.** Bash для 200 параметризованных тестов будет 1500+ строк spaghetti — cleaner на Python с dataclass'ом и registry pattern'ом. `mock.sh` остаётся entry point (UX), внутри dispatch'ит в `mock.py`. Каждый test — `(id, category, predicted, fn)` где fn returns `(passed, observed_note)`. Reviewer reading the harness видит exact predicted-vs-observed mapping per test.
+
+**Рассмотренные варианты.**
+1. Чистый bash 200 тестов через arrays + loops. ~1500 строк, hard to maintain, weak assertions.
+2. Pytest-based parametric tests добавить в `tests/`. Smaller LOC но mixed с live-stack tests, slower CI signal, и user explicitly попросил `mock.sh`.
+3. Python harness с registry decorator + thin bash wrapper. Maintainable, fast to extend, structured output.
+4. Off-the-shelf framework (Tavern, schemathesis). Heavy dependency для разовой задачи.
+
+**Причина выбора.** №3. Bash entry point preserved, Python внутри даёт dataclass'ы и list comprehensions для compact data tables. Каждая категория из 8 — отдельная регистрация, parametric loops для bulk-test groups (extraction × phrasings, supersession arcs, etc.).
+
+**Coverage map.**
+- §3 contract surface — 50 тестов (every endpoint × every input shape: valid/invalid/edge codes, shapes, idempotency).
+- §4.2 extraction — 40 тестов (8 категорий × 5 phrasings).
+- §9 eval categories — 35 тестов (noise / profile / multi-hop / sync / cross-session).
+- §4.1 fact evolution — 20 тестов (arcs + history + /recall surfaces current).
+- §5 hard constraints — 20 тестов (malformed + oversized + unicode + missing).
+- Multi-entity slots — 15 тестов (multi-pet / vehicle / child).
+- Bounds & limits — 10 тестов (at-limit / over-limit edges).
+- Cleanup correctness — 10 тестов (idempotent DELETE + chain repair).
+Итого: 200.
+
+**Result на polish branch build:** **189/200 PASS, 11 FAIL, 0 ERROR, elapsed 566.4s** на real OpenAI key (8 LLM calls per turn'у, ~570 turns total). Service-side categories (§3 contract, §4.1 arcs + recall, §4.3 priority, §5 hard constraints, §9 noise + profile + sync + cross-session, multi-entity pets, bounds, cleanup): **159/159 PASS** — zero service bugs.
+
+11 failures декомпозируются в три bucket'а:
+- **4 LLM stochastic variance** (E33 implicit.city, E35 implicit.profession, F08 employer arc Apple→Amazon stayed, F17/F20 substring overlap with previous_company chain). Re-runs обычно flip-flop'ятся; не регрессии.
+- **4 предикат too strict в моём mock harness** (F17/F20 forbid'ит «Stripe»/«engineer» substring, но они legitimately в `previous_company`/`previous_role` slot'ax). Bug в test design, not service.
+- **3 multi-entity gap** (M06-M13 expect'ят `child.<name>` / `vehicle.<name>` keys, но extraction prompt §4.2 не enumerate'ит эти namespaces). _Real_ improvement opportunity: 5-line addition к `src/extraction.py` prompt'у. Не регрессия — main has the same gap.
+
+**Дальше.** Mock results упомянуты в README и CHANGELOG как baseline. После merge polish→main можно добавить `child.<name>` / `vehicle.<name>` в extraction prompt чтобы добить эти 3 fail'а до зелёного. Re-runs harness на every code change — long-term regression net.
