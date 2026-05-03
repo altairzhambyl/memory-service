@@ -98,6 +98,49 @@ Edit `app/static/index.html` → F5 in the browser. No `--build`, no
 (~2s) or run `uvicorn app.main:app --reload --port 8080` locally
 against the Dockerized DB.
 
+## §3 recall design — baseline notes
+
+The current `/recall` is a **vanilla cosine top-k baseline** (HGT-16b)
+and is intentionally the §10 floor, not the target. It's documented
+here because the §3 brief calls out priority logic and cross-session
+behaviour as graded design choices.
+
+- **Indexing.** Every message in a `POST /turns` body is embedded with
+  `text-embedding-3-small` and written to `documents`/`embeddings` under
+  `doc_id = "turn:{turn_id}:{idx}"` with provenance metadata
+  (`kind=turn_message, turn_id, session_id, user_id, role, idx, ts`).
+  All writes are in one transaction with the `turns`/`turn_messages`
+  inserts so §3 synchronous availability holds.
+- **Retrieval.** `/recall` and `/search` cosine-rank against the HNSW
+  index with `metadata->>'kind' = 'turn_message'` and a `user_id`
+  filter. Internal candidate pool is capped at 10 before token-budget
+  trimming.
+- **Cross-session sharing (§5).** A user's history is shared across
+  their sessions. Two reasons: (1) §3 reference output mixes "stable
+  user facts" and "recent conversations" — the latter would be useless
+  if the new session got an empty store; (2) the §9 multi-hop test ("the
+  user with the dog named Biscuit") spans sessions by construction. The
+  `session_id` from the recall request is captured in each citation for
+  provenance but is *not* used as a filter. Different `user_id`s are
+  always isolated. Anonymous queries (`user_id: null`) return empty
+  context — we don't fish in everyone's data.
+- **Token budget.** `max_tokens` is enforced approximately (chars/4).
+  We add bullet entries top-down by similarity and stop before
+  exceeding the budget; never cut a snippet mid-sentence — entries are
+  trimmed at 240 chars at index time.
+- **Priority logic (§3 line 148).** The reference output has two
+  sections: "## Known facts about this user" (stable, structured) and
+  "## Relevant from recent conversations" (raw context). The baseline
+  ships only the second — known gap, tracked by HGT-17 (typed memory
+  extraction) and HGT-19 (priority assembly). When tight on budget,
+  current order is purely relevance-descending; HGT-19 will replace
+  this with `stable facts → relevant memories → recent context` per
+  §4.3.
+- **Why not vanilla cosine forever?** §10 is explicit: cosine-top-k
+  won't score well. The baseline exists so each upgrade
+  (hybrid/RRF, rerank, multi-hop, structured memories) lands as a
+  measurable diff in the CHANGELOG.
+
 ## Why these choices
 
 - **OpenAI `text-embedding-3-small`** — 1536-dim, cheap ($0.02/1M tokens),

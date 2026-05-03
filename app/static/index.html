@@ -385,6 +385,165 @@
       opacity: 0.62;
     }
 
+    .s3-panel {
+      overflow-y: auto;
+      padding: 22px;
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .s3-panel.active {
+      display: flex;
+    }
+
+    .s3-card {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .s3-card h2 {
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .s3-card .desc {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .s3-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px;
+    }
+
+    .s3-row input,
+    .s3-row textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #fbfcfd;
+      color: var(--text);
+      font: inherit;
+    }
+
+    .s3-row textarea {
+      grid-column: 1 / -1;
+      min-height: 90px;
+      resize: vertical;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .s3-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .s3-action {
+      border: 1px solid var(--blue);
+      background: var(--blue);
+      color: white;
+      cursor: pointer;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-weight: 600;
+    }
+
+    .s3-action.ghost {
+      background: var(--panel);
+      color: var(--blue);
+    }
+
+    .s3-action.danger {
+      border-color: var(--red);
+      background: var(--panel);
+      color: var(--red);
+    }
+
+    .s3-action:disabled {
+      cursor: wait;
+      opacity: 0.62;
+    }
+
+    .s3-output {
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafb;
+      padding: 10px 12px;
+      color: var(--text);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    .s3-counts {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+
+    .s3-pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: var(--panel-2);
+    }
+
+    .s3-pill strong {
+      color: var(--blue);
+    }
+
+    .s3-pill.warn strong {
+      color: var(--red);
+    }
+
+    .s3-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    .s3-table th,
+    .s3-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .s3-table th {
+      color: var(--muted);
+      font-weight: 600;
+      background: var(--panel-2);
+    }
+
+    .s3-table td.mono {
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .s3-empty {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 8px 2px;
+    }
+
     @media (max-width: 760px) {
       .shell {
         grid-template-columns: 1fr;
@@ -420,6 +579,7 @@
         <button class="nav-button active" data-view="chat" type="button">Chat</button>
         <button class="nav-button" data-view="text" type="button">All history text</button>
         <button class="nav-button" data-view="json" type="button">All history JSON</button>
+        <button class="nav-button" data-view="s3" type="button">§3 panel</button>
       </div>
       <p class="section-label">User</p>
       <div class="user-list" aria-label="Users">
@@ -447,6 +607,79 @@
       </section>
       <section class="history-panel" id="historyJsonPanel" aria-live="polite">
         <pre class="history-output" id="historyJson"></pre>
+      </section>
+
+      <section class="s3-panel" id="s3Panel" aria-live="polite">
+        <article class="s3-card">
+          <h2>1. POST /turns — write smoke turn</h2>
+          <p class="desc">Sends the §7 Berlin payload. Edit the JSON if you want to vary user_id or session_id; the form fields below default to user-1 / smoke-1.</p>
+          <div class="s3-row">
+            <input id="s3TurnUser" placeholder="user_id" value="user-1">
+            <input id="s3TurnSession" placeholder="session_id" value="smoke-1">
+          </div>
+          <div class="s3-row">
+            <textarea id="s3TurnPayload" spellcheck="false"></textarea>
+          </div>
+          <div class="s3-actions">
+            <button class="s3-action" id="s3SendTurn" type="button">POST /turns</button>
+            <button class="s3-action ghost" id="s3ResetPayload" type="button">Reset payload</button>
+          </div>
+          <pre class="s3-output" id="s3TurnResult">No request sent yet.</pre>
+        </article>
+
+        <article class="s3-card">
+          <h2>2. GET /admin/turn_index — verify storage</h2>
+          <p class="desc">Filters indexed turn-message rows by user_id and (optional) session_id. Counts should match across documents and embeddings.</p>
+          <div class="s3-row">
+            <input id="s3IxUser" placeholder="user_id (blank = all)" value="user-1">
+            <input id="s3IxSession" placeholder="session_id (blank = all)">
+          </div>
+          <div class="s3-actions">
+            <button class="s3-action" id="s3RefreshIndex" type="button">Refresh index</button>
+            <button class="s3-action ghost" id="s3ClearIndexFilter" type="button">Clear filters</button>
+          </div>
+          <div class="s3-counts" id="s3IxCounts">
+            <span class="s3-pill">documents: <strong>—</strong></span>
+            <span class="s3-pill">embeddings: <strong>—</strong></span>
+          </div>
+          <div id="s3IxTableWrap">
+            <p class="s3-empty">Click refresh to load.</p>
+          </div>
+        </article>
+
+        <article class="s3-card">
+          <h2>3. POST /recall — relevance lookup</h2>
+          <p class="desc">Cosine top-k over indexed turn messages, scoped by user_id. Cross-session sharing for the same user is intentional (§5 — see README). Probe should surface the Berlin/NYC turn for "Where does this user live?".</p>
+          <div class="s3-row">
+            <input id="s3RecallQuery" placeholder="query" value="Where does this user live?">
+            <input id="s3RecallSession" placeholder="session_id" value="smoke-2">
+            <input id="s3RecallUser" placeholder="user_id" value="user-1">
+            <input id="s3RecallMaxTokens" type="number" min="1" max="32768" value="512">
+          </div>
+          <div class="s3-actions">
+            <button class="s3-action" id="s3SendRecall" type="button">POST /recall</button>
+          </div>
+          <div class="s3-counts" id="s3RecallMetrics">
+            <span class="s3-pill">top score: <strong>—</strong></span>
+            <span class="s3-pill">citations: <strong>—</strong></span>
+            <span class="s3-pill">~tokens used: <strong>—</strong></span>
+          </div>
+          <pre class="s3-output" id="s3RecallResult">No request sent yet.</pre>
+        </article>
+
+        <article class="s3-card">
+          <h2>4. DELETE — verify cleanup leaves no orphans</h2>
+          <p class="desc">DELETE /users/{user_id} or /sessions/{session_id}. After 204 the index above should drop to zero.</p>
+          <div class="s3-row">
+            <input id="s3DeleteUser" placeholder="user_id" value="user-1">
+            <input id="s3DeleteSession" placeholder="session_id" value="smoke-1">
+          </div>
+          <div class="s3-actions">
+            <button class="s3-action danger" id="s3DeleteUserBtn" type="button">DELETE /users/&lt;user_id&gt;</button>
+            <button class="s3-action danger" id="s3DeleteSessionBtn" type="button">DELETE /sessions/&lt;session_id&gt;</button>
+          </div>
+          <pre class="s3-output" id="s3DeleteResult">No request sent yet.</pre>
+        </article>
       </section>
 
       <form class="composer" id="composer">
@@ -481,6 +714,7 @@
     };
 
     const messagesEl = document.querySelector("#messages");
+    const s3PanelEl = document.querySelector("#s3Panel");
     const historyTextPanel = document.querySelector("#historyTextPanel");
     const historyJsonPanel = document.querySelector("#historyJsonPanel");
     const historyTextEl = document.querySelector("#historyText");
@@ -785,11 +1019,16 @@
       messagesEl.classList.toggle("active", view === "chat");
       historyTextPanel.classList.toggle("active", view === "text");
       historyJsonPanel.classList.toggle("active", view === "json");
+      s3PanelEl.classList.toggle("active", view === "s3");
       composerEl.style.display = view === "chat" ? "grid" : "none";
 
       if (view === "chat") {
         renderTopbar();
         loadHistory();
+      } else if (view === "s3") {
+        currentUserEl.firstChild.nodeValue = "§3 contract panel";
+        currentSessionEl.textContent = "verify HGT-16a writes/cleanup";
+        s3RefreshIndex();
       } else {
         currentUserEl.firstChild.nodeValue =
           view === "text" ? "All history text" : "All history JSON";
@@ -797,6 +1036,222 @@
         loadAllHistory();
       }
     }
+
+    // ---------- §3 panel ----------
+
+    const s3 = {
+      turnUser: document.querySelector("#s3TurnUser"),
+      turnSession: document.querySelector("#s3TurnSession"),
+      turnPayload: document.querySelector("#s3TurnPayload"),
+      turnResult: document.querySelector("#s3TurnResult"),
+      sendTurnBtn: document.querySelector("#s3SendTurn"),
+      resetPayloadBtn: document.querySelector("#s3ResetPayload"),
+      ixUser: document.querySelector("#s3IxUser"),
+      ixSession: document.querySelector("#s3IxSession"),
+      ixCounts: document.querySelector("#s3IxCounts"),
+      ixTableWrap: document.querySelector("#s3IxTableWrap"),
+      refreshBtn: document.querySelector("#s3RefreshIndex"),
+      clearFilterBtn: document.querySelector("#s3ClearIndexFilter"),
+      recallQuery: document.querySelector("#s3RecallQuery"),
+      recallSession: document.querySelector("#s3RecallSession"),
+      recallUser: document.querySelector("#s3RecallUser"),
+      recallMax: document.querySelector("#s3RecallMaxTokens"),
+      recallResult: document.querySelector("#s3RecallResult"),
+      recallMetrics: document.querySelector("#s3RecallMetrics"),
+      sendRecallBtn: document.querySelector("#s3SendRecall"),
+      deleteUser: document.querySelector("#s3DeleteUser"),
+      deleteSession: document.querySelector("#s3DeleteSession"),
+      deleteResult: document.querySelector("#s3DeleteResult"),
+      deleteUserBtn: document.querySelector("#s3DeleteUserBtn"),
+      deleteSessionBtn: document.querySelector("#s3DeleteSessionBtn"),
+    };
+
+    function s3DefaultPayload(userId, sessionId) {
+      return {
+        session_id: sessionId,
+        user_id: userId,
+        messages: [
+          { role: "user", content: "I just moved to Berlin from NYC last month. Loving it so far." },
+          { role: "assistant", content: "That sounds exciting! Berlin is a great city. How are you settling in?" },
+        ],
+        timestamp: new Date().toISOString(),
+        metadata: {},
+      };
+    }
+
+    function s3FillPayload() {
+      s3.turnPayload.value = JSON.stringify(
+        s3DefaultPayload(s3.turnUser.value.trim() || "user-1", s3.turnSession.value.trim() || "smoke-1"),
+        null, 2,
+      );
+    }
+
+    s3FillPayload();
+    s3.turnUser.addEventListener("input", s3FillPayload);
+    s3.turnSession.addEventListener("input", s3FillPayload);
+    s3.resetPayloadBtn.addEventListener("click", () => { s3FillPayload(); });
+
+    function s3WriteJson(target, value) {
+      target.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    }
+
+    async function s3SendTurn() {
+      let body;
+      try {
+        body = JSON.parse(s3.turnPayload.value);
+      } catch (err) {
+        s3WriteJson(s3.turnResult, `JSON parse error: ${err.message}`);
+        return;
+      }
+      s3.sendTurnBtn.disabled = true;
+      try {
+        const data = await requestJson("/turns", { method: "POST", body: JSON.stringify(body) });
+        s3WriteJson(s3.turnResult, { status: 201, response: data });
+        s3RefreshIndex();
+      } catch (err) {
+        s3WriteJson(s3.turnResult, `Error: ${err.message}`);
+      } finally {
+        s3.sendTurnBtn.disabled = false;
+      }
+    }
+
+    function s3RenderIndex(data) {
+      const docColor = data.documents_count === data.embeddings_count ? "" : "warn";
+      s3.ixCounts.innerHTML =
+        `<span class="s3-pill"><span>documents: </span><strong>${data.documents_count}</strong></span>` +
+        `<span class="s3-pill ${docColor}"><span>embeddings: </span><strong>${data.embeddings_count}</strong></span>` +
+        `<span class="s3-pill"><span>shown: </span><strong>${data.rows.length}</strong></span>`;
+
+      if (!data.rows.length) {
+        s3.ixTableWrap.innerHTML = '<p class="s3-empty">No rows match. Send a turn above, then refresh.</p>';
+        return;
+      }
+      const rowsHtml = data.rows.map((r) => {
+        const m = r.metadata || {};
+        const text = r.text.length > 140 ? r.text.slice(0, 140) + "…" : r.text;
+        return `<tr>
+          <td class="mono">${escapeHtml(r.doc_id)}</td>
+          <td>${escapeHtml(m.user_id ?? "")}</td>
+          <td>${escapeHtml(m.session_id ?? "")}</td>
+          <td>${escapeHtml(m.role ?? "")}</td>
+          <td>${escapeHtml(String(m.idx ?? ""))}</td>
+          <td>${r.has_embedding ? "✓" : "✗"}</td>
+          <td>${escapeHtml(text)}</td>
+        </tr>`;
+      }).join("");
+      s3.ixTableWrap.innerHTML = `
+        <table class="s3-table">
+          <thead><tr>
+            <th>doc_id</th><th>user_id</th><th>session_id</th><th>role</th><th>idx</th><th>vec</th><th>text</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      `;
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    async function s3RefreshIndex() {
+      const params = new URLSearchParams();
+      const u = s3.ixUser.value.trim();
+      const sid = s3.ixSession.value.trim();
+      if (u) params.set("user_id", u);
+      if (sid) params.set("session_id", sid);
+      params.set("limit", "50");
+      s3.refreshBtn.disabled = true;
+      try {
+        const data = await requestJson(`/admin/turn_index?${params.toString()}`);
+        s3RenderIndex(data);
+      } catch (err) {
+        s3.ixCounts.innerHTML = `<span class="s3-pill warn"><strong>Error: ${escapeHtml(err.message)}</strong></span>`;
+        s3.ixTableWrap.innerHTML = "";
+      } finally {
+        s3.refreshBtn.disabled = false;
+      }
+    }
+
+    s3.refreshBtn.addEventListener("click", s3RefreshIndex);
+    s3.clearFilterBtn.addEventListener("click", () => {
+      s3.ixUser.value = "";
+      s3.ixSession.value = "";
+      s3RefreshIndex();
+    });
+    s3.sendTurnBtn.addEventListener("click", s3SendTurn);
+
+    function s3RenderRecallMetrics(data) {
+      const cites = data.citations || [];
+      const top = cites.length ? Math.max(...cites.map((c) => c.score)) : null;
+      const ctx = data.context || "";
+      const approxTokens = Math.ceil(ctx.length / 4);
+      const topClass = top != null && top >= 0.4 ? "" : "warn";
+      s3.recallMetrics.innerHTML =
+        `<span class="s3-pill ${topClass}">top score: <strong>${top != null ? top.toFixed(3) : "—"}</strong></span>` +
+        `<span class="s3-pill">citations: <strong>${cites.length}</strong></span>` +
+        `<span class="s3-pill">~tokens used: <strong>${approxTokens}</strong></span>`;
+    }
+
+    async function s3SendRecall() {
+      const body = {
+        query: s3.recallQuery.value.trim() || "Where does this user live?",
+        session_id: s3.recallSession.value.trim() || "smoke-2",
+        user_id: s3.recallUser.value.trim() || null,
+        max_tokens: parseInt(s3.recallMax.value, 10) || 512,
+      };
+      s3.sendRecallBtn.disabled = true;
+      try {
+        const data = await requestJson("/recall", { method: "POST", body: JSON.stringify(body) });
+        s3WriteJson(s3.recallResult, { request: body, response: data });
+        s3RenderRecallMetrics(data);
+      } catch (err) {
+        s3WriteJson(s3.recallResult, `Error: ${err.message}`);
+        s3.recallMetrics.innerHTML =
+          `<span class="s3-pill warn">error</span>`;
+      } finally {
+        s3.sendRecallBtn.disabled = false;
+      }
+    }
+
+    s3.sendRecallBtn.addEventListener("click", s3SendRecall);
+
+    async function s3DeleteUser() {
+      const u = s3.deleteUser.value.trim();
+      if (!u) { s3WriteJson(s3.deleteResult, "user_id is required"); return; }
+      s3.deleteUserBtn.disabled = true;
+      try {
+        await requestJson(`/users/${encodeURIComponent(u)}`, { method: "DELETE" });
+        s3WriteJson(s3.deleteResult, `204 No Content — deleted user ${u}`);
+        s3RefreshIndex();
+      } catch (err) {
+        s3WriteJson(s3.deleteResult, `Error: ${err.message}`);
+      } finally {
+        s3.deleteUserBtn.disabled = false;
+      }
+    }
+
+    async function s3DeleteSession() {
+      const sid = s3.deleteSession.value.trim();
+      if (!sid) { s3WriteJson(s3.deleteResult, "session_id is required"); return; }
+      s3.deleteSessionBtn.disabled = true;
+      try {
+        await requestJson(`/sessions/${encodeURIComponent(sid)}`, { method: "DELETE" });
+        s3WriteJson(s3.deleteResult, `204 No Content — deleted session ${sid}`);
+        s3RefreshIndex();
+      } catch (err) {
+        s3WriteJson(s3.deleteResult, `Error: ${err.message}`);
+      } finally {
+        s3.deleteSessionBtn.disabled = false;
+      }
+    }
+
+    s3.deleteUserBtn.addEventListener("click", s3DeleteUser);
+    s3.deleteSessionBtn.addEventListener("click", s3DeleteSession);
 
     document.querySelector("#composer").addEventListener("submit", (event) => {
       event.preventDefault();
