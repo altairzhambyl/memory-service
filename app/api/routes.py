@@ -21,6 +21,8 @@ from app.api.schemas import (
     ChatSessionCreateResponse,
     ChatSessionListResponse,
     Citation,
+    FixtureAggregate,
+    FixtureProbeResult,
     IngestRequest,
     IngestResponse,
     QueryHit,
@@ -28,11 +30,14 @@ from app.api.schemas import (
     QueryResponse,
     RecallRequest,
     RecallResponse,
+    RunFixtureRequest,
+    RunFixtureResponse,
     SearchHit,
     SearchRequest,
     SearchResponse,
     TurnIndexResponse,
     TurnIndexRow,
+    TurnMessage,
     TurnRequest,
     TurnResponse,
     UserMemoriesResponse,
@@ -749,4 +754,163 @@ async def admin_turn_index(
             )
             for r in rows
         ],
+    )
+
+
+# =====================================================================
+# Recall-quality measurement harness — CLAUDE.md §7 / §10.
+#
+# Loads fixtures/recall/<name>.json, resets each fix-* user, ingests its
+# conversations through create_turn() (so production write-path runs
+# end-to-end), then probes /recall and reports per-probe verdicts +
+# aggregate metrics. The static UI calls this to make every retrieval
+# upgrade a measurable diff in CHANGELOG.
+# =====================================================================
+
+
+_FIXTURE_USER_PREFIX = "fix-"
+_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "recall"
+
+
+def _parse_iso_z(s: str) -> datetime:
+    # asyncpg rejects naive datetimes for timestamptz; the §3 contract
+    # also explicitly says ISO-8601, so we normalise the trailing Z.
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+@router.post("/admin/run_fixture", response_model=RunFixtureResponse)
+async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
+    """
+    Run a recall-quality fixture end-to-end and return per-probe + aggregate
+    metrics. Destructive: resets every user_id in the fixture, but only if
+    that user_id is prefixed `fix-` (guard against zapping real data).
+    """
+    fixture_path = _FIXTURE_DIR / f"{payload.name}.json"
+    if not fixture_path.exists():
+        raise HTTPException(status_code=404, detail=f"fixture_not_found:{payload.name}")
+
+    started = datetime.now()
+    fixture = json.loads(fixture_path.read_text())
+
+    user_ids = sorted({c["user_id"] for c in fixture["conversations"]})
+    for uid in user_ids:
+        if not uid.startswith(_FIXTURE_USER_PREFIX):
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsafe_user_id:{uid} (must start with '{_FIXTURE_USER_PREFIX}')",
+            )
+
+    # 1. Reset fixture users so re-runs are idempotent.
+    for uid in user_ids:
+        await delete_section3_user(uid)
+
+    # 2. Ingest each turn via the real create_turn so the production
+    #    embed+index path runs. Capture turn_id by label for verdict mapping.
+    label_to_turn_id: dict[str, str] = {}
+    for conv in fixture["conversations"]:
+        for turn in conv["turns"]:
+            req = TurnRequest(
+                session_id=turn["session_id"],
+                user_id=conv["user_id"],
+                messages=[TurnMessage(**m) for m in turn["messages"]],
+                timestamp=_parse_iso_z(turn["timestamp"]),
+                metadata={"fixture": payload.name, "turn_label": turn["label"]},
+            )
+            resp = await create_turn(req)
+            label_to_turn_id[turn["label"]] = resp.id
+
+    turn_id_to_label = {v: k for k, v in label_to_turn_id.items()}
+    noise_max_top = float(fixture.get("noise_max_top_score", 0.35))
+
+    # 3. Probe /recall and compute per-probe verdicts.
+    probes_out: list[FixtureProbeResult] = []
+    positive_top1 = positive_top3 = positive_total = 0
+    noise_passed = noise_total = 0
+    positive_top_scores: list[float] = []
+
+    for probe in fixture["probes"]:
+        is_noise = bool(probe.get("noise", False))
+        rec_req = RecallRequest(
+            query=probe["query"],
+            session_id=probe["session_id"],
+            user_id=probe["user_id"],
+            max_tokens=int(probe.get("max_tokens", 512)),
+        )
+        rec_resp = await recall(rec_req)
+        cites = rec_resp.citations
+        top_score = cites[0].score if cites else None
+        top_label = turn_id_to_label.get(cites[0].turn_id) if cites else None
+
+        if is_noise:
+            noise_total += 1
+            ok = (not cites) or (top_score is not None and top_score < noise_max_top)
+            if ok:
+                noise_passed += 1
+            probes_out.append(FixtureProbeResult(
+                label=probe["label"],
+                query=probe["query"],
+                is_noise=True,
+                top_hit_turn_label=top_label,
+                top_score=top_score,
+                citations_count=len(cites),
+                passed=ok,
+                notes=f"noise threshold < {noise_max_top}",
+            ))
+            continue
+
+        positive_total += 1
+        expected_label = probe.get("expected_turn_label")
+        expected_id = label_to_turn_id.get(expected_label) if expected_label else None
+        expected_subs = list(probe.get("expected_any_substring", []))
+
+        passed_top1 = bool(cites) and cites[0].turn_id == expected_id
+        passed_top3 = any(c.turn_id == expected_id for c in cites[:3])
+        substring_match = False
+        if cites and expected_subs:
+            joined = " ".join(c.snippet for c in cites[:3]).lower()
+            substring_match = any(s.lower() in joined for s in expected_subs)
+        passed = passed_top1 and substring_match
+
+        if passed_top1:
+            positive_top1 += 1
+        if passed_top3:
+            positive_top3 += 1
+        if top_score is not None:
+            positive_top_scores.append(top_score)
+
+        probes_out.append(FixtureProbeResult(
+            label=probe["label"],
+            query=probe["query"],
+            is_noise=False,
+            expected_turn_label=expected_label,
+            expected_substrings=expected_subs,
+            top_hit_turn_label=top_label,
+            top_score=top_score,
+            citations_count=len(cites),
+            passed_top1=passed_top1,
+            passed_top3=passed_top3,
+            substring_match=substring_match,
+            passed=passed,
+            notes=f"expected={expected_label} got={top_label}",
+        ))
+
+    elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
+    aggregate = FixtureAggregate(
+        name=payload.name,
+        total=len(probes_out),
+        positive_total=positive_total,
+        positive_passed_top1=positive_top1,
+        positive_passed_top3=positive_top3,
+        noise_total=noise_total,
+        noise_passed=noise_passed,
+        recall_at_1=(positive_top1 / positive_total) if positive_total else 0.0,
+        recall_at_3=(positive_top3 / positive_total) if positive_total else 0.0,
+        noise_resistance=(noise_passed / noise_total) if noise_total else 0.0,
+        mean_top_score=(sum(positive_top_scores) / len(positive_top_scores))
+            if positive_top_scores else 0.0,
+    )
+    return RunFixtureResponse(
+        aggregate=aggregate,
+        probes=probes_out,
+        elapsed_ms=elapsed_ms,
     )
