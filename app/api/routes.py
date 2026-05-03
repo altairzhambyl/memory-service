@@ -410,10 +410,11 @@ async def delete_chat_history(
 
 # =====================================================================
 # API contract endpoints. These are the eval-facing surface.
-# Embedding, retrieval, LLM extraction, and stable-fact priority
-# assembly (`## Known facts about this user`) are live; 
-# supersession (MS-18) is the next slice and will deduplicate the
-# memory set surfaced here.
+# Embedding, retrieval, LLM extraction, stable-fact priority
+# assembly (`## Known facts about this user`), and supersession
+# on (user_id, key) collision are live. /users/{id}/memories preserves
+# the supersession chain (active=FALSE rows kept, linked via
+# `supersedes`).
 # =====================================================================
 
 
@@ -504,15 +505,49 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             )
 
         for mem in extracted:
+            # supersession on (user_id, key). Three cases:
+            #   1. No prior active row     → plain insert.
+            #   2. Same key, same value    → idempotent: refresh
+            #      the existing row's updated_at and skip insert.
+            #      Avoids polluting `## Known facts` with duplicates
+            #      when the user re-states a fact across turns.
+            #   3. Same key, new value     → insert new row with
+            #      supersedes=old.id, flip old.active=FALSE.
+            #      Old row stays for /users/{id}/memories history.
+            prior = await conn.fetchrow(
+                """
+                SELECT id, value
+                FROM   memories
+                WHERE  user_id = $1 AND key = $2 AND active = TRUE
+                """,
+                payload.user_id, mem["key"],
+            )
+            if prior is not None and prior["value"] == mem["value"]:
+                await conn.execute(
+                    "UPDATE memories SET updated_at = NOW() WHERE id = $1",
+                    prior["id"],
+                )
+                continue
+            new_id = str(uuid.uuid4())
+            supersedes = prior["id"] if prior is not None else None
+            if prior is not None:
+                await conn.execute(
+                    """
+                    UPDATE memories
+                    SET    active = FALSE, updated_at = NOW()
+                    WHERE  id = $1
+                    """,
+                    prior["id"],
+                )
             await conn.execute(
                 """
                 INSERT INTO memories (
                     id, user_id, type, key, value, confidence,
                     source_session, source_turn, supersedes, active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, TRUE)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
                 """,
-                str(uuid.uuid4()),
+                new_id,
                 payload.user_id,
                 mem["type"],
                 mem["key"],
@@ -520,6 +555,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 float(mem["confidence"]),
                 payload.session_id,
                 turn_id,
+                supersedes,
             )
     return TurnResponse(id=turn_id)
 
@@ -682,10 +718,10 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     2. Query-relevant recent turns — cosine top-k over indexed messages.
 
     priority is "stable facts → query-relevant memories → recent
-    context". Layer 2 here covers facts and recent context together via
-    the cosine pipeline; the dedicated query-relevant-memories layer
-    (embedding similarity over memory rows) is a deliberate next slice
-    once MS-18 supersession deduplicates the memory set.
+    context". With supersession in place, the memory set is
+    deduplicated by (user_id, key); a dedicated query-relevant-memories
+    layer via embedding similarity over memory rows is a future
+    refinement.
 
     cold semantics: empty store, unknown user, or zero matches → 200
     with `{"context": "", "citations": []}`. Never errors.
@@ -765,11 +801,10 @@ async def search(payload: SearchRequest) -> SearchResponse:
 async def list_user_memories(user_id: str) -> UserMemoriesResponse:
     """
     Return typed structured memories for the user (inspection
-    endpoint). Default ordering: most-recently updated first so the
-    reviewer sees the freshest state at the top. We return active rows
-    only by default — superseded history will surface once MS-18
-    introduces the supersession chain and a `?include_inactive=true`
-    flag is needed.
+    endpoint). requires the supersession chain to be preserved
+    here, so we return both active and inactive rows. Order:
+    active-first, then most-recently updated, so the reviewer sees
+    the current state on top with superseded history below.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -779,8 +814,8 @@ async def list_user_memories(user_id: str) -> UserMemoriesResponse:
                     source_session, source_turn,
                     created_at, updated_at, supersedes, active
             FROM    memories
-            WHERE   user_id = $1 AND active = TRUE
-            ORDER BY updated_at DESC, id ASC
+            WHERE   user_id = $1
+            ORDER BY active DESC, updated_at DESC, id ASC
             """,
             user_id,
         )
