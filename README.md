@@ -161,6 +161,175 @@ Citations carry `turn_id`, cosine score, and snippet.
 
 ---
 
+## Backing store — why pgvector, not a separate vector DB
+
+One Postgres instance via `asyncpg` covers three access patterns:
+relational rows (`turns`, `turn_messages`, `memories`), vector cosine
+via HNSW (`vector_cosine_ops`, `m=16`, `ef_construction=64`), and
+full-text via `tsvector` + GIN.
+
+**Why this over Qdrant / Weaviate / Kuzu:**
+
+- **Synchronous correctness.** Each `/turns` call writes turn
+  metadata, embedded turn-message documents, extracted memories, and
+  `kind='memory'` sibling docs in **one transaction**. A two-store
+  design (Postgres for memories, vector DB for vectors) cannot give
+  this guarantee without a write-ahead log or eventual-consistency
+  dance — both ruled out by the brief.
+- **One thing to operate.** Single named Docker volume
+  (`rag-db-data`) preserves everything. No second backup story, no
+  second connection-pool ceiling, no second migration runner.
+- **Scale ceiling honest.** asyncpg pool is sized to 10; HNSW handles
+  the row counts a developer demo will hit (≤100 RPS comfortably).
+  Beyond that, sharding pgvector or moving to a dedicated index is a
+  future concern, not a hackathon one (out-of-scope).
+- **HNSW is fast enough.** Cosine top-30 over 5–500 docs/user runs in
+  single-digit ms; the 60 s `/turns` budget is dominated by the
+  OpenAI embed + extract roundtrips, not the DB.
+
+Schema lives in `migrations/`: `001_init` (documents + embeddings),
+`003_turns` (turn store), `004_memories` (typed memory
+chain), `005_bm25_hybrid` (FTS column + GIN), `006_memory_documents`
+(kind='memory' discriminator), `007_canonical_slots` (slot column +
+partial unique index for supersession concurrency).
+
+---
+
+## Extraction pipeline
+
+`app/extraction.py` calls `client.chat.completions.parse` with a
+Pydantic `ExtractionResponse` schema (OpenAI Structured Outputs). The
+model returns JSON validated against the schema server-side — no
+custom parser, no `json_object` mode failures, no schema drift between
+identical calls. Model: `gpt-4o-mini` with `timeout=30 s` and
+`max_retries=0` on the hot path (the SDK default of 2 retries × 30 s
+would blow the 60 s `/turns` budget on a 429 burst; per-call retry
+is the eval's job, not ours).
+
+**Eight categories covered, all in the prompt with examples drawn
+from the v1 fixture:**
+
+| Category | Example keys |
+| --- | --- |
+| Employment | `employment.company`, `employment.role`, `employment.previous_company` |
+| Location | `location.city`, `location.previous_city` |
+| Family / pets | `pet.name`, `pet.species`, `pet.age_years`, `family.spouse_name` |
+| Preferences | `diet.style`, `beverage.coffee` |
+| Opinions | `opinion.<topic>` |
+| Allergies | `allergy` |
+| Implicit facts | `walking Biscuit` → `pet.name=Biscuit` |
+| Corrections | `actually, I meant…` — the corrected fact only |
+
+Every emitted memory carries `type ∈ {fact, preference, opinion,
+event}`, `key`, `value`, and `confidence ∈ [0, 1]` (0.95 explicit,
+0.85 implied, 0.65 hedged).
+
+**What is deliberately not extracted:**
+
+- Multi-turn corrections that need previous-turn context. The
+  extractor sees one turn at a time; cross-turn judging is MS-26's
+  canonical-slot supersession layer instead.
+- Free-form narrative summarisation. Each memory is a single atomic
+  fact, not a paragraph.
+- Sensitive data classification (PII tagging). Out of scope for .
+
+**Failure handling.**
+`extract_memories_from_turn(messages) → (memories, error_or_none)`
+never raises on transient failure. Caught: `RateLimitError`,
+`APITimeoutError`, `APIConnectionError`, `BadRequestError`,
+`LengthFinishReasonError`, `ContentFilterFinishReasonError`,
+`ValidationError`, plus a last-resort `Exception` net. The error
+string is persisted in `turns.metadata.extraction_error` and the turn
+still commits with `memories=[]`. `AuthenticationError` is the **only
+exception that propagates** — it indicates a config bug, not transient
+runtime state, and silently degrading would hide a missing API key.
+
+---
+
+## Fact evolution & supersession
+
+The `memories` table is append-only. Updates happen via the
+*supersession chain*: a new fact for the same canonical slot flips
+the prior row's `active=FALSE` and sets `supersedes=<old.id>`. Old
+rows are not deleted — `/users/{id}/memories` returns the full
+chain so reviewers can audit history.
+
+**Insert path inside `create_turn`** (MS-18 + MS-26 + MS-27):
+
+| Prior active row for `(user_id, slot)` | Action |
+| --- | --- |
+| None | Plain insert. `slot` computed via canonical-alias map. |
+| Same slot, identical value | Idempotent: `UPDATE memories SET updated_at=NOW()`. No new row. Avoids polluting `## Known facts` with duplicates when the user re-states a fact. |
+| Same slot, different value | Mark old row `active=FALSE, updated_at=NOW()`. Insert new row with `supersedes=old.id`. Delete the old `kind='memory'` document so `/recall` doesn't surface stale facts. |
+
+**Canonical slot map (MS-26).** The LLM emits varying keys for the
+same semantic slot — `opinion.typescript`, `opinion.typescript.generics`,
+`language.favourite` could all describe the same opinion arc.
+`_canonicalise_slot(key)` collapses them deterministically:
+
+- 25-entry alias dict for employment / location / diet / allergy /
+  beverage variants. Example: `employment.company`, `employer`,
+  `current_employer`, `company` → `employment.current_company`.
+- Hierarchical opinion collapse: `opinion.<a>.<b>...` → `opinion.<a>`.
+  Closes opinion-arc supersession across LLM phrasings.
+- Fallback `slot=key` for anything unknown (preserves multi-entity
+  slots like `pet.name` / `family.spouse_name`).
+
+**Concurrency safety (MS-27).**
+`pg_advisory_xact_lock(hashtextextended($1, 0))` keyed on
+`f"{user_id}:{slot}"` serialises read-modify-write across concurrent
+`/turns` to the same slot. The partial unique index
+`UNIQUE (user_id, slot) WHERE active=TRUE` is the DB backstop — even
+if the application logic ever bugs, Postgres rejects a second active
+row for the same slot.
+
+**Opinion arcs.** The brief calls these out as harder than clean
+overwrites. Current implementation: hierarchical slot collapse handles
+across-phrasing supersession; the chain stays linear (love →
+annoyed → pragmatic = three rows, two superseded, one active). A
+multi-step LLM judge that synthesises arc summaries is documented as
+out of scope and tracked for follow-up.
+
+---
+
+## Tradeoffs
+
+| Optimised for | Given up |
+| --- | --- |
+| One backing store, one transaction, no eventual consistency | LLM-judge canonicalisation — extra latency + non-determinism vs deterministic alias map |
+| Synchronous extraction inside `/turns` (60 s budget) | Throughput on bursts — `max_retries=0` on the hot path means a 429 returns zero memories rather than retrying |
+| Deterministic `(user_id, slot)` supersession | Cross-encoder reranker (Cohere / local) — extra latency we do not yet have eval evidence to justify (tracked MS-35) |
+| query-aware fact ranking + per-fact relevance gate | Explicit query rewriting / multi-hop graph traversal (tracked MS-34) |
+| Original prompt, original schema, single-file-per-concern | Bigger framework conveniences (no Celery / Kafka / queue) |
+| Hybrid retrieval (cosine + Postgres FTS via RRF) | Field-weighted BM25, IDF-precision tuning (would need `pg_search` / ParadeDB or external index) |
+
+The brief weights iteration history. Every tradeoff above has a
+CHANGELOG entry recording why we picked it and a Linear ticket
+recording when (or whether) we revisit.
+
+---
+
+## Failure modes
+
+| Failure | Behaviour | Trace |
+| --- | --- | --- |
+| Missing `OPENAI_API_KEY` | `docker compose up` fails fast on `${OPENAI_API_KEY:?…}` interpolation. Listed in `.env.example`. | docker error log |
+| OpenAI 5xx / 429 / DNS / timeout on `/turns` | Persist turn metadata + extracted memories. Skip embedding writes. `turns.metadata.embed_error="rate_limit"` (or `timeout` / `connection` / `bad_request:{status}`). Return 201. | `/admin/turn_index` `embed_failures` count + warn log |
+| OpenAI failure on extraction | Extraction returns `(memories=[], error="…")`. Turn still commits with empty memories. `turns.metadata.extraction_error` set. | `/admin/turn_index` `extraction_failures` count |
+| Both embed AND extract fail | 503 with `{error:"upstream_unavailable", retryable:true, embed_error, extract_error}`. Eval may retry. | response body |
+| OpenAI auth bug (invalid key) | `AuthenticationError` re-raises → 5xx. Loud failure, not silent zero memories. | uvicorn error log |
+| `embed_query` failure on `/recall` | `## Known facts` block still renders from Postgres (no embedding needed). Conversation block goes cold; citations empty. 200 response. | `recall.embed_failed` warn log |
+| `embed_query` failure with no memories | Fully cold per the API contract: `{context:"", citations:[]}`. | warn log |
+| DB pool acquisition fails | FastAPI exception middleware serialises `{error:"internal_server_error", request_id}`. `/health` returns 503 until pool recovers. | request_id in log |
+| Restart mid-write | Single transaction guarantees turn + memories + embeddings either all land or none. Verified by `test_restart_persistence`. | transaction log |
+| Malformed input | Pydantic v2 returns 422. Unicode oddities (RTL override, emoji, control chars) accepted as payload. Verified by `test_malformed_input_no_crash`. | Pydantic error |
+| Concurrent `/turns` to the same canonical slot | Advisory lock serialises; partial unique index is the DB backstop. Verified by `test_concurrent_turns_to_same_slot_no_double_active`. | — |
+
+Five live-stack tests in `tests/contract/test_required_behaviors.py` cover the
+graceful-upstream paths (MS-24); a sixth covers concurrency (MS-27).
+
+---
+
 ## Project structure
 
 ```
