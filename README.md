@@ -1,9 +1,23 @@
-# Memory Service
+# Memory Service — `main` (service-only)
 
 A Dockerised memory service for an AI agent. Ingests conversation turns,
 extracts typed structured memories, and answers recall queries with a
 priority-assembled context. Implements the HTTP contract from the
 the project's private working notes (`CLAUDE.md`).
+
+> **Branches.** `main` is the **service-only** build — only the 
+> HTTP surface, no static UI. Use this for an agent or eval that
+> drives the service over HTTP.
+>
+> The `with-ui` branch ships an inspection panel at
+> `http://localhost:8080/` — every endpoint has an editable JSON
+> card with response viewer + verdict pills (recall fixture, memories
+> table, turn index). Use it for a click-driven manual demo.
+>
+> ```bash
+> git clone               git@github.com:kekeront/ai-memory.git   # main = this branch, service only
+> git clone -b with-ui    git@github.com:kekeront/ai-memory.git   # with inspection UI
+> ```
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
@@ -23,13 +37,16 @@ docker compose up -d --build     # ~30s; pulls pgvector + builds the app
 bash scripts/smoke.sh            # /health → /turns → /recall → /users/{id}/memories
 ```
 
-Then open the inspection UI at <http://localhost:8080/> — each 
-endpoint has its own card with an editable JSON request, response
-viewer, and verdict pills.
+Run the recall-quality eval:
 
-Click **Run fixture** in card 5 to execute the recall-quality eval:
-expect `recall@1 6/6, recall@3 6/6, noise 1/1, mean 0.356,
-extraction_failures 0/5` on `v1`.
+```bash
+curl -sX POST http://localhost:8080/admin/run_fixture \
+  -H 'content-type: application/json' -d '{"name":"v1"}' | jq .aggregate
+```
+
+Expect `recall@1 6/6, recall@3 6/6, noise 1/1, mean 0.356,
+extraction_failures 0/5` on `v1`. Fixture `v2` covers stress
+probes — see [Recall pipeline](#recall-pipeline) and the [`fixtures/recall/`](fixtures/recall/) directory.
 
 ---
 
@@ -342,8 +359,7 @@ memory-service/
 │   ├── extraction.py           # gpt-4o-mini Structured Outputs extractor
 │   ├── embeddings/openai.py    # text-embedding-3-small (async)
 │   ├── db/pool.py              # asyncpg + pgvector codec + migration runner
-│   ├── obs/logging.py          # structlog JSON
-│   └── static/index.html       # inspection UI for every endpoint
+│   └── obs/logging.py          # structlog JSON
 ├── migrations/                 # 001_init … 007_canonical_slots
 ├── fixtures/recall/            # v1 (easy floor) + v2 (stress probes)
 ├── scripts/smoke.sh            # reference smoke flow

@@ -9,7 +9,6 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from fastapi.responses import FileResponse
 
 from app.api.schemas import (
     ChatDeleteResponse,
@@ -129,7 +128,6 @@ def _trim(text: str, n: int = _SNIPPET_CHARS) -> str:
     return text[: n - 1].rstrip() + "…"
 
 router = APIRouter()
-STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 
 
 # canonical-slot map (MS-26). Maps LLM-emitted display keys to a
@@ -297,11 +295,6 @@ async def health() -> dict[str, str]:
     async with pool.acquire() as conn:
         await conn.execute("SELECT 1")
     return {"status": "ok"}
-
-
-@router.get("/", include_in_schema=False)
-async def frontend() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
 
 
 @router.post("/ingest", response_model=IngestResponse, status_code=201)
@@ -1378,8 +1371,9 @@ async def delete_user_endpoint(user_id: str) -> Response:
 
 
 # =====================================================================
-# Admin / debug. Read-only inspector for the static UI so MS-16a can be
-# A/B verified without psql.
+# Admin / debug. Read-only inspector so MS-16a writes/cleanup can be
+# A/B verified via curl (or via the `with-ui` branch's inspection
+# panel) without psql.
 # =====================================================================
 
 
@@ -1491,8 +1485,8 @@ async def admin_turn_index(
 # Loads fixtures/recall/<name>.json, resets each fix-* user, ingests its
 # conversations through create_turn() (so production write-path runs
 # end-to-end), then probes /recall and reports per-probe verdicts +
-# aggregate metrics. The static UI calls this to make every retrieval
-# upgrade a measurable diff in CHANGELOG.
+# aggregate metrics. Curl + jq (or the `with-ui` branch's panel) makes
+# every retrieval upgrade a measurable diff in CHANGELOG.
 # =====================================================================
 
 

@@ -35,9 +35,10 @@ async def lifespan(_: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Simple RAG", version="0.1.0", lifespan=lifespan)
-    # Permissive CORS for local dev: lets you open the static UI from a
-    # different port (or file://) and still hit the API. Trim before any
-    # public deployment — `allow_origin_regex` covers any localhost port.
+    # Permissive CORS for local dev: lets a localhost client (e.g. the
+    # `with-ui` branch's inspection panel served from a separate port,
+    # or a curl/jq smoke harness) hit the API. Trim before any public
+    # deployment — `allow_origin_regex` covers any localhost port only.
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|null)$",
