@@ -421,3 +421,84 @@ def test_both_embed_and_extract_fail_returns_503():
         assert detail.get("error") == "upstream_unavailable", body
     finally:
         _clear_injected_failures()
+
+
+# =====================================================================
+# HGT-23 — query-relevant memories layer (§4.3 middle priority).
+# Without this test, the headline upgrade is only verified through the
+# admin fixture runner; a tight-budget regression in the Python sort
+# would slip past the eval's pytest invocation.
+# =====================================================================
+
+
+def test_recall_query_aware_memory_ranking():
+    """§4.3: under tight max_tokens, query-relevant facts must survive
+    the budget while irrelevant ones are dropped. Asserts HGT-23 sort
+    by query similarity, not the legacy type-priority sort.
+    """
+    sid = sid_recall = _unique("sess-qa")
+    uid = _unique("user-qa")
+    try:
+        # Two turns covering disjoint topics so the user has facts in
+        # both employment and diet namespaces. The LLM extracts both
+        # batches synchronously inside the /turns transaction.
+        _post_turn(sid, uid, "I work at Notion as a product manager.")
+        _post_turn(sid, uid,
+                   "I'm vegetarian, allergic to shellfish, and don't drink coffee.")
+
+        # Verify both fact families landed before stressing the ranker.
+        mem = httpx.get(f"{BASE}/users/{uid}/memories", timeout=10).json()
+        keys = {m["key"] for m in mem["memories"] if m["active"]}
+        assert any(k.startswith("employment.") for k in keys), keys
+        assert any(k in ("diet.style", "allergy", "beverage.coffee") for k in keys), keys
+
+        # The §4.3 contract: query-relevant facts come FIRST. Under
+        # the legacy type-priority sort, employment.* would lead the
+        # block; under HGT-23, diet/allergy/beverage lead and
+        # employment is pushed to the tail (or out, under tight
+        # budget). We assert the order — that's the falsifiable
+        # query-aware signal — independent of how many tail facts the
+        # budget happens to accommodate.
+        rec = httpx.post(
+            f"{BASE}/recall",
+            json={
+                "query": "What does this user eat?",
+                "session_id": sid_recall,
+                "user_id": uid,
+                "max_tokens": 60,
+            },
+            timeout=30,
+        ).json()
+        ctx = rec["context"]
+        assert "## Known facts about this user" in ctx, ctx
+
+        # Pull the fact lines in render order.
+        in_block = False
+        ordered_keys: list[str] = []
+        for line in ctx.splitlines():
+            if line.startswith("## Known facts"):
+                in_block = True
+                continue
+            if line.startswith("## "):
+                in_block = False
+                continue
+            if in_block and line.startswith("- ") and ": " in line:
+                key = line[2:].split(": ", 1)[0]
+                ordered_keys.append(key)
+
+        diet_keys = {"diet.style", "allergy", "beverage.coffee"}
+        employment_keys = {"employment.company", "employment.role"}
+        diet_positions = [i for i, k in enumerate(ordered_keys) if k in diet_keys]
+        employment_positions = [
+            i for i, k in enumerate(ordered_keys) if k in employment_keys
+        ]
+        assert diet_positions, f"no diet fact in block: {ordered_keys}"
+        # If any employment fact appears, every one must come AFTER
+        # every diet fact — the query-aware signal.
+        if employment_positions:
+            assert min(employment_positions) > max(diet_positions), (
+                f"employment fact ranked above diet (legacy type-priority "
+                f"behaviour): {ordered_keys}"
+            )
+    finally:
+        httpx.delete(f"{BASE}/users/{uid}", timeout=10)
