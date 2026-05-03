@@ -11,6 +11,7 @@ with a priority-assembled context. Implements the §3 contract from
 cp .env.example .env             # put OPENAI_API_KEY in .env
 docker compose up -d --build     # ~30s — pulls pgvector, builds the app
 until curl -sf http://localhost:8080/health >/dev/null; do sleep 0.3; done
+bash scripts/smoke.sh            # §3 contract smoke: /turns → /recall → /users/{id}/memories
 ```
 
 Inspection UI at <http://localhost:8080/>: every §3 endpoint has a
@@ -323,7 +324,8 @@ memory-service/
 │   └── static/index.html      # inspection UI (every §3 endpoint)
 ├── migrations/                # 001_init, 002_chat_sessions,
 │                                003_section3_turns, 004_memories,
-│                                005_bm25_hybrid, 006_memory_documents
+│                                005_bm25_hybrid, 006_memory_documents,
+│                                007_canonical_slots
 ├── fixtures/recall/            # v1 (easy floor) + v2 (§9 stress probes)
 ├── tests/contract/            # §3 shape tests + §7 required tests
 ├── docker-compose.yml         # db + app, named volume rag-db-data

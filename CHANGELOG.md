@@ -225,3 +225,16 @@ The helpers are imported directly from `app.api.routes` — they're already pure
 README's «How to run tests» section restructured into two tiers — offline floor (always-runs) and live-stack (gated). Reviewer running plain `pytest` now gets a fast deterministic signal на pure recall logic; live-stack tests stay gated behind `RAG_E2E=1` так как они нуждаются в Docker + real OpenAI key.
 
 **Линковка:** HGT-30 → Done. Codex audit triage 6/7 closed; only HGT-31 (smoke script + src/ rename) remains — cosmetic, Patch D.
+
+2026-05-03
+HGT-31 (Patch D) — smoke script aligned with §3 contract — §3, §7, §8, §13
+Codex evidence: `scripts/smoke.sh` всё ещё executed legacy simple-RAG flow `/ingest`+`/query`, не §3 contract. CLAUDE.md §7 explicitly provides the contract smoke flow (`/health` → `/turns` → `/recall` → `/users/{user_id}/memories`); reviewer copying smoke commands from README получал mismatch с §3.
+Fix: rewrote `scripts/smoke.sh` под exact §7 reference flow:
+* `GET /health`
+* `POST /turns` — Berlin/NYC turn (§7 reference payload verbatim).
+* `POST /recall` — query «Where does this user live?» с max_tokens=512.
+* `GET /users/$USER_ID/memories` — assert typed structured rows (key/value/confidence/active).
+* `DELETE /users/$USER_ID` — eval cleanup (§3 204).
+README quickstart теперь pointers reviewer'а на `bash scripts/smoke.sh` после `docker compose up`. Layout rename `app/ → src/` НЕ delivered: CLAUDE.md §13 explicitly says «Our current layout uses `app/` instead of `src/` per Python convention — the brief is permissive on language layout». Rename touches Dockerfile, all imports, tests; pure churn без correctness gain. Документировано в Patch D scope.
+**Verification:** `bash scripts/smoke.sh` end-to-end успешно: 2 typed memories extracted (location.city=Berlin, location.previous_city=NYC, both active=TRUE), DELETE returns 204. Cleanup идемпотентен.
+**Линковка:** HGT-31 → Done. **Codex audit triage 7/7 closed.** Submission contract polishing complete.
