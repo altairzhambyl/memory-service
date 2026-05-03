@@ -1,153 +1,133 @@
 # Memory Service
 
-A Dockerised memory service for an AI agent. Ingests conversation
-turns, extracts typed structured memories, and answers recall queries
-with a priority-assembled context. Implements the §3 contract from
-`CLAUDE.md`.
+A Dockerised memory service for an AI agent. Ingests conversation turns,
+extracts typed structured memories, and answers recall queries with a
+priority-assembled context. Implements the §3 HTTP contract from the
+Higgsfield AI Engineering Challenge brief (`CLAUDE.md`).
 
-## Quickstart
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
+![Postgres](https://img.shields.io/badge/Postgres-16-336791?logo=postgresql&logoColor=white)
+![pgvector](https://img.shields.io/badge/pgvector-HNSW-336791)
+![OpenAI](https://img.shields.io/badge/OpenAI-gpt--4o--mini%20%2B%20text--embedding--3--small-412991?logo=openai&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-22%20offline%20%2B%2024%20live-brightgreen)
+![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
+
+---
+
+## Quick Start
 
 ```bash
-cp .env.example .env             # put OPENAI_API_KEY in .env
-docker compose up -d --build     # ~30s — pulls pgvector, builds the app
-until curl -sf http://localhost:8080/health >/dev/null; do sleep 0.3; done
-bash scripts/smoke.sh            # §3 contract smoke: /turns → /recall → /users/{id}/memories
+cp .env.example .env             # add OPENAI_API_KEY=...
+docker compose up -d --build     # ~30s; pulls pgvector + builds the app
+bash scripts/smoke.sh            # /health → /turns → /recall → /users/{id}/memories
 ```
 
-Inspection UI at <http://localhost:8080/>: every §3 endpoint has a
-panel with editable JSON, response viewer, and verdict pills. Run the
-recall fixture from card 5 and you should see `recall@1 6/6,
-recall@3 6/6, noise 1/1, mean 0.356, extraction_failures 0/5`.
+Then open the inspection UI at <http://localhost:8080/> — each §3
+endpoint has its own card with an editable JSON request, response
+viewer, and verdict pills.
 
-## Что сделано
+Click **Run fixture** in card 5 to execute the recall-quality eval:
+expect `recall@1 6/6, recall@3 6/6, noise 1/1, mean 0.356,
+extraction_failures 0/5` on `v1`.
 
-- §3 контракт. 7 endpoints, exact shapes, статусы, persistence через named volume.
-- Извлечение. `gpt-4o-mini` Structured Outputs, 8 категорий §4.2, graceful degradation на transient OpenAI fail.
-- Хранилище. Postgres + pgvector, один volume, 7 миграций. Один store, одна транзакция per `/turns`.
-- Supersession §4.1. Canonical `slot` map + partial UNIQUE на `(user_id, slot) WHERE active=TRUE` + `pg_advisory_xact_lock`. История цепочки видна в `/users/{id}/memories`.
-- Hybrid retrieval §10. Cosine top-30 + Postgres FTS top-30, RRF k=60. Не vanilla cosine top-k.
-- Query-aware facts §4.3. Sibling `kind='memory'` documents, hybrid-rank по query similarity. Под tight budget irrelevant facts отбрасываются first.
-- Noise gate §9. Block-level relevance check + per-hit cosine filter. Off-topic queries возвращают cold context.
-- Graceful upstream §5. Embed/extract failures → 201 with `embed_error`/`extraction_error` в metadata, никогда 5xx на transient blip. Both fail → 503 retryable.
-- Tests. 19 offline + 23 live = **42 passed**. Fixtures: v1 (floor: recall@1=6/6) + v2 (multi-hop, kw-anchored, supersession arcs, tight-budget, noise-typed-user — 9 probes, all PASS).
-- CHANGELOG. 13 metric-bearing entries, §10 минимум 4+ перевыполнен.
-- Inspection UI. Все §3 endpoints + admin observability + fixture runner с verdict pills.
+---
 
-## Что не сделано
+## What this is
 
-- `app/` → `src/` rename. CLAUDE.md §13 разрешает `app/`. Pure churn без runtime gain.
-- Async/background re-embed или re-slot job. Out of scope §12. `/turns` остаётся synchronous.
-- LLM-judge canonicalization. Лишняя latency и non-determinism пока deterministic slot map не оказался недостаточным.
-- Per-fact relevance gate. Текущий recall использует query-aware ranking + budget ordering. Stricter off-topic fact gate — следующий hardening step, **HGT-32**, потому что noise resistance это named eval category.
+Reviewers asked for a memory layer that an AI agent can sit on top of:
+write completed conversation turns to it, query it for relevant
+context on the next turn, and trust that what comes back is
+**structured, current, and on-topic**. The brief explicitly disqualifies
+"raw chunks in, top-k cosine out" as a passing solution
+(`CLAUDE.md` §10).
+
+This implementation answers each scored category with a deliberate
+mechanism, not a default:
+
+| Eval category (§9) | Mechanism in this repo |
+| --- | --- |
+| Recall quality | Hybrid retrieval — cosine + Postgres FTS via RRF (`k=60`). Not vanilla top-k. |
+| Fact evolution | Canonical-slot supersession with a partial unique index + advisory lock. Old facts go inactive, history preserved. |
+| Multi-hop | Facts-first priority assembly — stable identity (city, employer, pets) always considered alongside conversation turns. |
+| Noise resistance | Two-stage gate: block-level relevance + per-fact cosine threshold. Off-topic queries return cold context. |
+| Extraction quality | `gpt-4o-mini` with OpenAI Structured Outputs. Eight §4.2 categories. Graceful failure: error string lives in `turns.metadata.extraction_error`. |
+| Persistence | Single named Docker volume; `docker compose down && up` survives. |
+| Cross-session | One transaction per `/turns` (turn + memories + indexed docs). No eventual consistency. |
+| Robustness | Pydantic at boundaries; transient OpenAI failures degrade gracefully (HGT-24). |
+| Synchronous correctness | After `POST /turns` returns 201, memories are queryable in the next call. |
+| Contract compliance | All seven §3 endpoints exact shape + status. 9 contract-shape tests. |
+
+---
 
 ## Architecture
 
 ```
-┌──────────┐   POST /turns      ┌──────────────────────────┐
-│  agent   │ ─────────────────▶ │       FastAPI            │
-│  (eval)  │ ◀─── 201 {id} ──── │  routes.py / schemas.py  │
-└──────────┘                    └────┬─────────────────────┘
-     │ POST /recall                  │  embed (text-embedding-3-small)
-     │   {query, user_id}            │  extract (gpt-4o-mini Structured Outputs)
-     ▼                               │
-┌──────────┐                         ▼
-│ context  │      ┌─────────────────────────────────────────┐
-│  block   │ ◀─── │  Postgres 16 + pgvector  (asyncpg)      │
-└──────────┘      │  ┌──────────┬───────────────────────┐   │
-                  │  │ turns    │ session_id, user_id   │   │
-                  │  │ turn_msgs│ FK turns, role, idx   │   │
-                  │  │ documents│ id, text, metadata    │   │
-                  │  │ embeddings│ vec(1536) HNSW cosine│   │
-                  │  │ memories │ type/key/value chain  │   │
-                  │  └──────────┴───────────────────────┘   │
-                  └─────────────────────────────────────────┘
+                     ┌──────────────────────────────────────────┐
+                     │             FastAPI (app/api)            │
+                     │ ┌──────────────────────────────────────┐ │
+       POST /turns   │ │ /turns   /recall   /search           │ │
+       ─────────────▶│ │ /users/{id}/memories                 │ │
+                     │ │ DELETE /sessions/{id}, /users/{id}   │ │
+                     │ │ /admin/turn_index, /admin/run_fixture│ │
+                     │ └────────┬───────────────┬─────────────┘ │
+                     └──────────│───────────────│───────────────┘
+                                │               │
+                  embed (1536)  │               │  extract (gpt-4o-mini)
+                  ───────▶ OpenAI ◀───────       │
+                                │               │
+                                ▼               ▼
+                     ┌──────────────────────────────────────────┐
+                     │  Postgres 16 + pgvector  (asyncpg pool)  │
+                     │ ┌──────────────────────────────────────┐ │
+                     │ │ turns         : session_id, user_id  │ │
+                     │ │ turn_messages : FK turns, role, idx  │ │
+                     │ │ documents     : kind, metadata, tsv  │ │
+                     │ │ embeddings    : vector(1536) HNSW    │ │
+                     │ │ memories      : type/key/value/slot  │ │
+                     │ │                supersedes, active    │ │
+                     │ └──────────────────────────────────────┘ │
+                     └──────────────────────────────────────────┘
 ```
 
-Three layers, one process per box: **API** (FastAPI + Pydantic v2),
-**Retrieval/Extraction** (OpenAI clients with explicit timeouts +
-`max_retries=0` on the hot path), **Data** (pgvector + asyncpg pool).
-A single transaction per `/turns` covers turn metadata, embedded
-turn-message documents, and extracted memories — §5 synchronous
-correctness with no eventual consistency.
+Three layers, one process per box. **API** (FastAPI + Pydantic v2)
+handles HTTP and contract shapes. **Retrieval / extraction** owns the
+OpenAI clients with explicit timeouts and `max_retries=0` on the hot
+path to keep the §3 60-second `/turns` budget intact. **Data**
+(pgvector + asyncpg) is one store: relational rows for memories and
+turns, vector cosine via HNSW, full-text via `tsvector` + GIN. Every
+`/turns` request commits in a single transaction — the brief's "no
+eventual consistency" rule (§5) is the guarantee.
 
-## Backing store — pgvector + Postgres
+---
 
-Postgres 16 with the `pgvector` extension, accessed via `asyncpg`.
-Everything lives in one named Docker volume (`rag-db-data`) so
-`docker compose down && up` preserves data.
+## §3 Contract endpoints
 
-- One store, two access patterns: relational rows for memories /
-  turns, vector cosine over `embeddings.embedding` with HNSW
-  (`vector_cosine_ops`, m=16, ef_construction=64). No second system
-  to keep in sync, no eventual-consistency dance.
-- `documents` carries provenance JSONB (`kind`, `turn_id`,
-  `session_id`, `user_id`, `role`, `idx`, `ts`) for citations and for
-  scoping cosine queries by `user_id`.
-- `memories` is a real append-only chain: `supersedes` text pointer,
-  canonical `slot`, and `active` boolean. A partial unique index on
-  `(user_id, slot) WHERE active=TRUE` prevents two current facts in the
-  same semantic slot; `/users/{id}/memories` returns the full chain and
-  `/recall` filters `active=TRUE` for current state.
+| Method | Path | Returns |
+| --- | --- | --- |
+| `GET` | `/health` | `200 {"status":"ok"}` |
+| `POST` | `/turns` | `201 {"id":"<turn_id>"}` — synchronous: persists turn, embeddings, extracted memories |
+| `POST` | `/recall` | `200 {"context":"...","citations":[...]}` — facts-first context under `max_tokens` |
+| `POST` | `/search` | `200 {"results":[...]}` — structured rows, agent-tool-style |
+| `GET` | `/users/{user_id}/memories` | `200 {"memories":[{type,key,value,...}]}` |
+| `DELETE` | `/sessions/{session_id}` | `204` |
+| `DELETE` | `/users/{user_id}` | `204` |
 
-We considered Kuzu / Qdrant / a separate vector DB earlier but pulled
-back: at this scale the second runtime adds risk without buying us
-anything we cannot do with one HNSW index and a JSONB column.
+Admin (out of contract): `GET /admin/turn_index`,
+`POST /admin/run_fixture`, `POST /admin/recanonicalise_memories`,
+`POST /admin/reembed_memories`, `POST /admin/inject_embed_failure`
+(test-only).
 
-## Extraction pipeline (§4.2)
+---
 
-`app/extraction.py` calls `client.chat.completions.parse` with a
-Pydantic `ExtractionResponse` schema (OpenAI Structured Outputs) so the
-JSON is validated server-side at decode time. Model: `gpt-4o-mini`.
+## Recall pipeline
 
-The prompt is original — it covers the §4.2 categories and uses
-fixture content for examples (no copy from mem0/honcho/hindsight per
-§11):
-
-- `employment.company`, `employment.role`, `employment.previous_company`
-- `location.city`, `location.previous_city`
-- `pet.name`, `pet.species`, `pet.age_years`, `family.spouse_name`
-- `diet.style`, `beverage.coffee`, `allergy`
-- `opinion.<topic>`
-- Implicit facts (`walking Biscuit` → `pet.name=Biscuit`)
-- Corrections (`actually, I meant…` — only the corrected fact is kept)
-
-Every emitted memory carries `type ∈ {fact, preference, opinion, event}`,
-`key`, `value`, and `confidence ∈ [0,1]` (0.95 explicit / 0.85 implied
-/ 0.65 hedged).
-
-**Failure handling.** `extract_memories_from_turn` never raises on
-transient API failure: it returns `(memories, error_or_none)`. Caught:
-`RateLimitError`, `APITimeoutError`, `APIConnectionError`,
-`BadRequestError`, `LengthFinishReasonError`,
-`ContentFilterFinishReasonError`, `ValidationError`, plus a last-resort
-`Exception` net. The error string is persisted in
-`turns.metadata.extraction_error` and the turn still commits with
-`memories=[]`. `AuthenticationError` is deliberately re-raised — that
-is a config bug, silently degrading would hide it.
-
-**Hot-path policy.** `client.with_options(max_retries=0)` and an
-explicit `timeout=30.0` on the parse call. SDK default is 600 s with 2
-retries; under that default a 429 burst can chain 3 × 30 s and blow
-the §3 60 s `/turns` budget. Single attempt or fail.
-
-**Deliberately unsupported (current).** Multi-turn corrections that
-require remembering a *previous* turn's content are handled only when
-the new extraction lands in the same canonical slot. There is no
-LLM-judge over the full history. Long opinion arcs are stored under a
-canonical `opinion.<topic>` slot; the full arc is reconstructable from
-the supersession chain in `/users/{id}/memories`, while `/recall`
-surfaces only the latest active opinion.
-
-## Recall strategy (§3, §4.3)
-
-`/recall` builds a two-section context under a `max_tokens` budget:
+`/recall` builds the §3 reference context:
 
 ```
 ## Known facts about this user
 - employment.company: Notion
-- employment.role: product manager
 - location.city: Berlin
-- location.previous_city: NYC
 - pet.name: Biscuit
 
 ## Relevant from recent conversations
@@ -155,225 +135,138 @@ surfaces only the latest active opinion.
 - ...
 ```
 
-End-to-end:
+Five steps, all under one `max_tokens` budget:
 
-1. **Fetch active memories** for `user_id` from Postgres (no embedding
-   needed — direct relational read).
-2. **Embed query** with `text-embedding-3-small`. If this fails (transient
-   OpenAI blip), the `## Known facts` block still renders from step 1;
-   only the conversation block goes cold (§5 / HGT-24).
-3. **Hybrid retrieval over conversation chunks** = cosine top-30 (HNSW on
-   `text-embedding-3-small`) + Postgres FTS top-30 (`tsvector` +
-   `ts_rank_cd`), fused via **Reciprocal Rank Fusion** with `k=60`
-   (Cormack-Buettcher-Clarke 2009). Cosine catches semantic intent;
-   FTS catches keyword-anchored queries (rare proper nouns, technical
-   terms) where short-turn embeddings are weak. Per §10: ranking is
-   deliberate, not vanilla cosine top-k.
-4. **Hybrid retrieval over memory rows** (HGT-23): the same cosine + FTS
-   + RRF over `kind='memory'` documents — each active memory has a
-   sibling `key: value` document written at /turns time. Returns a
-   `{memory_id: rrf_score}` map used to re-sort the facts block by
-   query similarity.
-5. **Noise gate (HGT-25)**: facts and conversation hits both gate on
-   relevance. The `## Known facts` block renders only when (memory
-   hybrid top-RRF ≥ 0.02) OR (conversation top-cosine ≥ 0.20) OR
-   (query matches a profile-allowlist regex like *"tell me about this
-   user"*). Conversation hits below cosine 0.20 are filtered out
-   entirely. Off-topic queries on a known user (§9 noise resistance)
-   return cold context — no hallucinated identity dump. The gate is
-   bypassed when `embed_query` failed (HGT-24 degraded mode) so the
-   user still gets their stable facts on a transient blip.
-6. **Assemble**: emit the `## Known facts` block first (sorted by query
-   similarity DESC, with `(type_priority, updated_at DESC)` as the
-   tail-sort for memories the retriever didn't score), then drain the
-   remaining budget into `## Relevant from recent conversations`. Under
-   tight budget, lowest-similarity facts are dropped first — irrelevant
-   ones never crowd out relevant ones. Section headers are
-   *provisional*: header cost is reserved against budget but committed
-   only when at least one body line fits, so very small budgets never
-   exceed §3's "approximate, don't blow past 2×".
-7. **Citations** carry `turn_id`, cosine score, and snippet (cosine
-   kept as the citation score for §3 interpretability; ordering is
-   by RRF). Memories are not duplicated as citations — reviewers
-   inspect them via `/users/{user_id}/memories`.
+1. **Fetch active memories** for `user_id` from Postgres — direct read, no embedding needed.
+2. **Embed query** with `text-embedding-3-small`. On transient failure, the facts block still renders (HGT-24 degraded mode).
+3. **Hybrid retrieval over conversation chunks** — cosine top-30 + Postgres FTS top-30, fused via Reciprocal Rank Fusion (`k=60`, Cormack-Buettcher-Clarke 2009). Replaces vanilla cosine top-k per §10.
+4. **Hybrid retrieval over memory rows** — same RRF over `kind='memory'` documents, returning a `{memory_id: {rrf, cosine}}` map for query-aware fact ranking.
+5. **Noise + per-fact gates** — facts only render when (a) memory RRF or conversation cosine clears the relevance threshold or (b) the query matches a profile-allowlist regex (`tell me about this user` etc.). Inside the block, each individual fact is gated on its own cosine ≥ 0.25 (`HGT-32`). Off-topic queries return cold context — §9 noise resistance.
 
-**Priority logic — graded design choice (§4.3).** Stable user identity
-beats episodic context. A user's employer, city, allergies, and pet
-are needed by *most* queries, so they always win the budget. Recent
-turns drain the leftover. This matches the §3 reference shape and is
-why a "where does the user live" query still gets the Berlin fact even
-when the conversation hits another topic.
+Citations carry `turn_id`, cosine score, and snippet.
 
-**Cold semantics (§3).** Empty store, unknown user, anonymous query
-(`user_id: null`), or zero matches → 200 with
-`{"context":"", "citations":[]}`. Never errors.
+---
 
-**Cross-session scoping (§5).** A user's history is shared across
-their `session_id`s — the multi-hop "user with the dog named Biscuit"
-test in §9 spans sessions by design. Different `user_id`s are
-*always* isolated; the request's `session_id` is captured in each
-citation for provenance but never used as a recall filter.
+## Tech stack
 
-## Fact evolution & supersession (§4.1)
+| Layer | Choice | Why |
+| --- | --- | --- |
+| Web | FastAPI + Pydantic v2 | Async-native, schema validation at boundaries |
+| DB | Postgres 16 + pgvector + `tsvector`/FTS | One store for relational + vector + keyword |
+| ORM | asyncpg (raw SQL) | Single-file pool, no ORM ceremony |
+| Embeddings | OpenAI `text-embedding-3-small` (1536-dim) | Cheap, ~50 ms, swappable in one file |
+| Extraction | OpenAI `gpt-4o-mini` Structured Outputs | Schema-validated JSON, no parse failures |
+| Container | Docker Compose | `up -d` boots both services; named volume persists |
+| Tests | pytest + httpx (live ASGI + offline pure helpers) | Fast offline floor + live-stack contract suite |
 
-Insert path in `create_turn`, three branches per extracted memory:
+---
 
-| Prior `(user_id, slot)` active row | Action |
-|---|---|
-| none | plain insert, `supersedes=NULL` |
-| same value | idempotent: `UPDATE memories SET updated_at=NOW()`; no new row |
-| different value | mark old `active=FALSE, updated_at=NOW()`; insert new with `supersedes=old.id` |
-
-`slot` is deterministic canonicalization over the LLM-emitted display
-`key`: employer/location/diet/allergy aliases collapse to stable slots
-(`employment.current_company`, `location.current_city`, etc.), and
-`opinion.<topic>.*` collapses to `opinion.<topic>`. The original `key`
-and `value` remain inspectable in `/users/{id}/memories`.
-
-Concurrency is guarded twice: `/turns` takes a transaction-scoped
-Postgres advisory lock on `(user_id, slot)`, and migration
-`007_canonical_slots.sql` adds a partial unique index on active rows.
-This prevents two concurrent turns from leaving two current facts in
-the same slot.
-
-Everything in the same transaction as the turn writes, so a reviewer
-querying `/users/{id}/memories` immediately after `/turns` sees the
-chain consistent with what `/recall` returns.
-
-`/recall` reads only `active=TRUE`, so the **current** fact is
-returned. `/users/{id}/memories` returns active + inactive rows
-(`ORDER BY active DESC, updated_at DESC`), so the **history** is
-preserved per §4.1.
-
-**Coverage and limits.** Slot-based supersession is deterministic and
-cheap. It handles location, employment, diet/allergy, beverage, and
-persistent preferences cleanly. Multi-entity facts such as two pets
-intentionally keep their original key namespace so they do not collapse
-onto one row. Opinion arcs (`I love TS` → `TS generics annoy me` →
-`TS for big projects`) share a topic slot, so the chain shows the
-trajectory, but the service does not synthesise an "evolved" prose
-summary — the current opinion wins.
-
-## Tradeoffs
-
-| Optimised for | Given up |
-|---|---|
-| One backing store, one transaction, no eventual consistency | LLM reranker / query rewriting / multi-hop graph traversal |
-| Synchronous extraction inside `/turns` (60 s budget) | Throughput on bursts — `max_retries=0` on the hot path means a 429 returns zero memories rather than retrying |
-| Deterministic `(user_id, slot)` supersession | LLM-judge contradiction detection — heavier, less predictable |
-| §4.3 query-aware fact ranking under tight budget | LLM reranker over the fused conversation candidate pool — extra latency we don't yet have evidence the eval rewards |
-| Original prompt, original schema, single Python file per concern | Bigger framework conveniences (no Celery / Kafka / queue) |
-
-## Failure modes
-
-- **Missing `OPENAI_API_KEY`** — startup fails fast via `${VAR:?}` in
-  `docker-compose.yml`. Listed in `.env.example`.
-- **OpenAI 5xx / 429 / timeout** — extractor returns
-  `(memories=[], error="rate_limit"|"timeout"|"connection"|...)`. The
-  turn still commits and the error string is persisted in
-  `turns.metadata.extraction_error`. `/admin/turn_index` and
-  `/admin/run_fixture` expose `extraction_failures` counts +
-  `extraction_error_modes` breakdown.
-- **Embedding outage on `/turns`** — if extraction produced memories,
-  the service still returns 201 and persists `turns`, raw
-  `turn_messages`, and typed memories with `turns.metadata.embed_error`.
-  `documents`/`embeddings` for that turn are skipped until a future
-  backfill; recall can still use the structured facts.
-- **OpenAI auth bug (bad key)** — `AuthenticationError` is re-raised
-  so `/turns` returns 5xx instead of silently producing zero memories.
-- **DB down** — pool acquisition raises, FastAPI exception middleware
-  serialises a `{"error":"internal_server_error","request_id":...}`.
-  `/health` returns 503 until the pool recovers.
-- **Restart mid-write** — single transaction guarantees turn +
-  memories + embeddings either all land or none. `test_restart_persistence`
-  enforces this.
-- **Malformed input** — Pydantic v2 returns 422 on shape errors;
-  unicode noise (RTL overrides, emoji, control chars) is accepted as
-  payload. `test_malformed_input_no_crash` enforces no 5xx.
-
-## How to run tests
-
-Two tiers — fast offline tests run on every invocation; live-stack
-contract tests are gated by `RAG_E2E=1` and need `docker compose up`.
-
-```bash
-# Offline floor — 19 unit tests on the pure recall helpers. <1s.
-# No Docker, no OpenAI. Runs on every CI invocation.
-.venv/bin/pytest -q tests/
-
-# Full suite — 42 tests including 23 live-stack contract tests.
-# Requires docker compose up + a real OPENAI_API_KEY in .env.
-RAG_E2E=1 .venv/bin/pytest -q tests/
-```
-
-**Offline (`tests/unit/test_recall_helpers.py`, 19 tests):**
-`_canonicalise_slot` (HGT-26) — alias collapse + opinion-hierarchical;
-`_parse_known_facts_block` — fixture-runner verdict helper;
-`_facts_block_relevant` (HGT-25) — noise gate signals + degraded-mode
-bypass; `_format_recall_context` — provisional headers (HGT-29),
-query-aware sort under tight budget (HGT-23), conversation-hit
-filter (HGT-25).
-
-**Live stack (`tests/contract/`, 23 tests):**
-12 contract-shape from `test_section3_shapes.py` + `test_shapes.py`;
-4 §7-required from `test_section7.py` — synchronous availability,
-concurrent-session isolation, malformed input no crash, restart
-persistence (HGT-20); 5 graceful-upstream cases — `/turns` survives
-embed blip, `/recall` returns facts when embed fails, `/recall` fully
-cold when embed fails and no memories, fixture runner aggregates
-failures, both-upstream-fail returns 503 (HGT-24); 1 query-aware
-memory ranking (HGT-23); 1 concurrency guard for canonical-slot
-collisions (HGT-27). The restart test invokes `docker compose restart
-app` via subprocess; it is auto-skipped when the docker CLI isn't on
-PATH.
-
-The §7 recall-quality fixtures are a separate, measured eval:
-
-```bash
-# v1 — easy floor; every probe is a near-paraphrase of one turn.
-curl -sX POST http://localhost:8080/admin/run_fixture \
-  -H 'Content-Type: application/json' -d '{"name":"v1"}' | jq .aggregate
-
-# v2 — multi-hop, keyword-anchored, supersession arcs, tight-budget probes.
-curl -sX POST http://localhost:8080/admin/run_fixture \
-  -H 'Content-Type: application/json' -d '{"name":"v2"}' | jq .aggregate
-```
-
-Or click **Run fixture** in card 5 of the inspection UI. **v1** has 7
-probes (6 positive + 1 noise) over 3 conversations
-(fix-berlin / fix-pet / fix-diet); current run reports
-`recall@1=6/6, recall@3=6/6, noise=1/1, mean=0.356, extraction_failures=0/5`.
-**v2** has 9 probes covering §9 categories — multi-hop linkage,
-keyword-anchored vs distractor, tight-budget priority assembly,
-supersession arcs (employer + opinion), adversarial noise, implicit
-fact extraction; current run reports `multihop@1=1/1, facts=6/6,
-forbidden_violations=0, supersession=1/1, noise=2/2, mean=0.450`.
-
-## Repo layout
+## Project structure
 
 ```
 memory-service/
 ├── app/
-│   ├── main.py                # FastAPI lifespan + pool + OpenAI client
+│   ├── main.py                 # FastAPI lifespan + DB pool + OpenAI client
 │   ├── api/
-│   │   ├── routes.py          # §3 contract endpoints + admin
-│   │   └── schemas.py         # Pydantic request/response models
-│   ├── extraction.py          # gpt-4o-mini Structured Outputs extractor
-│   ├── embeddings/openai.py   # text-embedding-3-small (async)
-│   ├── db/pool.py             # asyncpg + pgvector codec
-│   ├── obs/logging.py         # structlog JSON
-│   └── static/index.html      # inspection UI (every §3 endpoint)
-├── migrations/                # 001_init, 002_chat_sessions,
-│                                003_section3_turns, 004_memories,
-│                                005_bm25_hybrid, 006_memory_documents,
-│                                007_canonical_slots
+│   │   ├── routes.py           # §3 contract + admin endpoints
+│   │   └── schemas.py          # Pydantic request/response models
+│   ├── extraction.py           # gpt-4o-mini Structured Outputs extractor
+│   ├── embeddings/openai.py    # text-embedding-3-small (async)
+│   ├── db/pool.py              # asyncpg + pgvector codec + migration runner
+│   ├── obs/logging.py          # structlog JSON
+│   └── static/index.html       # inspection UI for every §3 endpoint
+├── migrations/                 # 001_init … 007_canonical_slots
 ├── fixtures/recall/            # v1 (easy floor) + v2 (§9 stress probes)
+├── scripts/smoke.sh            # §3 reference smoke flow
 ├── tests/
-│   ├── unit/                  # offline pure-helper tests
-│   └── contract/              # §3 shape tests + §7 required tests
-├── docker-compose.yml         # db + app, named volume rag-db-data
+│   ├── unit/                   # offline pure-helper tests (no Docker)
+│   └── contract/               # live-stack contract tests (RAG_E2E=1)
+├── docker-compose.yml          # db + app, named volume `rag-db-data`
 ├── Dockerfile
 ├── .env.example
-├── CHANGELOG.md               # iteration history (§6)
-└── CLAUDE.md                  # canonical Tech Reqs (§-numbered)
+├── CHANGELOG.md                # iteration log + decision rationale (Russian)
+└── CLAUDE.md                   # canonical Tech Reqs (§-numbered)
 ```
+
+---
+
+## How to run tests
+
+Two tiers.
+
+```bash
+# Offline floor — 22 unit tests on pure recall helpers. <1s. No Docker, no OpenAI.
+.venv/bin/pytest -q tests/
+
+# Full suite — live stack. Requires `docker compose up` + a real OPENAI_API_KEY.
+RAG_E2E=1 .venv/bin/pytest -q tests/
+```
+
+**Offline (`tests/unit/test_recall_helpers.py`, 22 tests):**
+canonical-slot collapse, `## Known facts` parsing, noise gate signals,
+provisional-header budget enforcement, query-aware fact sort,
+per-fact cosine gate.
+
+**Live (`tests/contract/`, 24 tests):**
+- 12 contract-shape tests covering §3 request/response shapes.
+- 4 §7-required tests (HGT-20): synchronous availability,
+  concurrent-session isolation, malformed input no-crash, restart
+  persistence.
+- 5 graceful-upstream tests (HGT-24): `/turns` survives embed blip,
+  `/recall` returns facts when embed fails, fully cold when no
+  memories, fixture runner aggregates failures, both-fail returns 503.
+- 1 query-aware ranking test (HGT-23).
+- 1 concurrency-canonical-slot guard (HGT-27).
+- 1 partial-overlap noise gate (HGT-32 via v2 fixture).
+
+The restart test invokes `docker compose restart app` via subprocess
+and is auto-skipped when the docker CLI is absent on PATH.
+
+### Recall-quality fixtures
+
+```bash
+curl -sX POST http://localhost:8080/admin/run_fixture \
+  -H 'content-type: application/json' -d '{"name":"v1"}' | jq .aggregate
+```
+
+- **v1** — 7 probes / 3 conversations. Floor:
+  `recall@1=6/6, mean=0.356`.
+- **v2** — 10 probes covering §9 categories (multi-hop linkage,
+  keyword-anchored vs distractor, supersession arcs for employer +
+  opinion, tight-budget priority assembly, adversarial noise,
+  partial-overlap noise, implicit fact). All probes pass:
+  `multihop@1=1/1, facts=6/6, forbidden=0, supersession=1/1, noise=1/1`.
+
+---
+
+## What ships
+
+- All seven §3 endpoints with exact shapes + status codes; persistence across restarts.
+- LLM extraction (`gpt-4o-mini` Structured Outputs) covering all eight §4.2 categories with graceful upstream-failure handling.
+- One-store data layer (Postgres + pgvector); single transaction per `/turns`.
+- Canonical-slot supersession with a partial unique index and `pg_advisory_xact_lock`. Chain visible via `/users/{id}/memories`.
+- Hybrid retrieval (cosine + Postgres FTS + RRF). Not vanilla top-k.
+- Query-aware fact ranking via sibling `kind='memory'` documents.
+- Two-stage noise gate: block-level + per-fact cosine threshold.
+- Graceful upstream-failure: embed/extract blip → 201 with metadata flag, never 5xx; both fail → 503 retryable.
+- 22 offline + 24 live tests = 46 passed. Two recall-quality fixtures (v1 + v2).
+
+## What does not ship
+
+- `app/ → src/` rename. CLAUDE.md §13 explicitly permits `app/` per Python convention.
+- Async/background re-embed or re-slot jobs. Out of scope per §12.
+- LLM-judge canonicalisation. Deterministic slot map is sufficient on the current fixture; see [HGT-37 ADRs](https://linear.app/hgtz/issue/HGT-37) for revisit criteria.
+- Cross-encoder reranker (Cohere `rerank-3` / local cross-encoder). Tracked as [HGT-35](https://linear.app/hgtz/issue/HGT-35); only meaningful with a `COHERE_API_KEY`.
+- Query rewriting / multi-hop subquery decomposition. Tracked as [HGT-34](https://linear.app/hgtz/issue/HGT-34); current pipeline solves §9's verbatim multi-hop example via facts-first assembly but a more general solver is the next ladder rung.
+
+---
+
+## Iteration log
+
+`CHANGELOG.md` (Russian) is the per-decision log — every dated entry
+cites the §-section it addresses and records measured deltas.
+14 metric-bearing entries covering HGT-14 through HGT-32. The brief
+weights iteration history (§6, §10) — read it for the *why*.
+
+`CLAUDE.md` is the canonical technical specification supplied with the
+challenge. The README and CHANGELOG both cite §-numbers from it.
