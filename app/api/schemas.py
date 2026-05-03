@@ -227,6 +227,15 @@ class FixtureProbeResult(BaseModel):
     passed: bool = False
     notes: str = ""
 
+    # MS-22 v2 extensions. All optional / default-empty so v1 fixtures
+    # serialise unchanged.
+    expected_known_facts_total: int = 0
+    expected_known_facts_present: int = 0
+    forbidden_known_facts_violated: int = 0
+    supersession_chain_length: int | None = None
+    supersession_expected_min: int | None = None
+    expected_top_score_under: float | None = None
+
 
 class FixtureAggregate(BaseModel):
     name: str
@@ -244,6 +253,19 @@ class FixtureAggregate(BaseModel):
     extraction_error_modes: dict[str, int] = Field(default_factory=dict)
     ingest_failures: int = 0
     ingest_error_modes: dict[str, int] = Field(default_factory=dict)
+
+    # MS-22 v2 extensions. Default to neutral values so v1 stays comparable.
+    multihop_total: int = 0
+    multihop_passed_top1: int = 0
+    multihop_passed_top3: int = 0
+    multihop_recall_at_1: float = 0.0
+    multihop_recall_at_3: float = 0.0
+    facts_expected: int = 0
+    facts_present: int = 0
+    forbidden_facts_violations: int = 0
+    supersession_chains_resolved: int = 0
+    supersession_chains_expected: int = 0
+    noise_top_score_violations: int = 0
 
 
 class RunFixtureResponse(BaseModel):
