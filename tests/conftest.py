@@ -29,7 +29,7 @@ async def client():
     immediately queryable) will land alongside the pytest fixture
     harness in MS-20a-2 against the live Docker stack.
     """
-    from app.main import create_app
+    from src.main import create_app
 
     app = create_app()
     transport = ASGITransport(app=app)

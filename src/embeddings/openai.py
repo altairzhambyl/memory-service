@@ -34,8 +34,8 @@ from openai import (
     RateLimitError,
 )
 
-from app.config import get_settings
-from app.obs.logging import get_logger
+from src.config import get_settings
+from src.obs.logging import get_logger
 
 log = get_logger(__name__)
 

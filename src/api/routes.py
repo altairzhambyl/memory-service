@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Response
 
-from app.api.schemas import (
+from src.api.schemas import (
     ChatDeleteResponse,
     ChatHistoryResponse,
     ChatMessage,
@@ -43,16 +43,16 @@ from app.api.schemas import (
     UserMemoriesResponse,
     UserMemory,
 )
-from app.config import get_settings
-from app.db.pool import get_pool
-from app.embeddings.openai import (
+from src.config import get_settings
+from src.db.pool import get_pool
+from src.embeddings.openai import (
     embed_documents,
     embed_query,
     get_client,
     inject_embed_failure,
 )
-from app.extraction import extract_memories_from_turn
-from app.obs.logging import get_logger
+from src.extraction import extract_memories_from_turn
+from src.obs.logging import get_logger
 
 log = get_logger(__name__)
 

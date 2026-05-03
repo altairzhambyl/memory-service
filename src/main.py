@@ -7,12 +7,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.middleware import RequestContextMiddleware
-from app.api.routes import router
-from app.config import get_settings
-from app.db.pool import close_pool, init_pool
-from app.embeddings.openai import get_client
-from app.obs.logging import configure_logging, get_logger
+from src.api.middleware import RequestContextMiddleware
+from src.api.routes import router
+from src.config import get_settings
+from src.db.pool import close_pool, init_pool
+from src.embeddings.openai import get_client
+from src.obs.logging import configure_logging, get_logger
 
 
 @asynccontextmanager

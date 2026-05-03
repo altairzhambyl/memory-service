@@ -17,3 +17,6 @@ htmlcov/
 .vscode/
 postgres-data/
 uv.lock
+
+# Private working notes — not part of the public repo.
+CLAUDE.md

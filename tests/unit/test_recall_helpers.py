@@ -6,7 +6,7 @@ no Postgres, no OpenAI. They run on a plain `pytest -q` invocation,
 giving the suite a fast deterministic floor independent of the live
 stack tests gated by `RAG_E2E=1`.
 
-The helpers are imported from `app.api.routes`. Importing that module
+The helpers are imported from `src.api.routes`. Importing that module
 constructs the FastAPI router but does not start the DB pool or hit
 OpenAI — both are lazy.
 """
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from app.api.routes import (
+from src.api.routes import (
     _canonicalise_slot,
     _facts_block_relevant,
     _format_recall_context,
