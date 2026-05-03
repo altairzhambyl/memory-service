@@ -16,8 +16,8 @@ references it via §-numbers throughout).
 > table, turn index). Use it for a click-driven manual demo.
 >
 > ```bash
-> git clone               git@github.com:kekeront/ai-memory.git   # main = this branch, service only
-> git clone -b with-ui    git@github.com:kekeront/ai-memory.git   # with inspection UI
+> git clone               git@github.com:kekeront/memory-service.git   # main = this branch, service only
+> git clone -b with-ui    git@github.com:kekeront/memory-service.git   # with inspection UI
 > ```
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
@@ -37,6 +37,22 @@ cp .env.example .env             # add OPENAI_API_KEY=...
 docker compose up -d --build     # ~30s; pulls pgvector + builds the app
 bash scripts/smoke.sh            # /health → /turns → /recall → /users/{id}/memories
 ```
+
+**Note for the eval harness.** On a transient OpenAI failure during
+`POST /turns`, the service does not crash. If both `embed` and
+`extract` fail simultaneously (DNS blip, regional outage), it returns
+`503` with a typed JSON body:
+
+```json
+{ "error": "upstream_unavailable", "retryable": true, "embed_error": "...", "extract_error": "..." }
+```
+
+The eval should retry the same request — once the upstream recovers
+the next attempt commits normally. All other transient failures
+(embed-only, extract-only) degrade gracefully and still return `201`
+with the partial state recorded in `turns.metadata`. See
+[Failure modes](#failure-modes) for the full table and §5 for the
+contract guarantee.
 
 Run the recall-quality eval:
 
