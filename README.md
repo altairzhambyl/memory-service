@@ -251,25 +251,39 @@ judge that adds latency and model-cost variance.
 
 ## How to run tests
 
+Two tiers — fast offline tests run on every invocation; live-stack
+contract tests are gated by `RAG_E2E=1` and need `docker compose up`.
+
 ```bash
-# unit / contract-shape tests against an ASGI stub (no DB / no API)
+# Offline floor — 19 unit tests on the pure recall helpers. <1s.
+# No Docker, no OpenAI. Runs on every CI invocation.
 .venv/bin/pytest -q tests/
 
-# full suite against the live stack (must have docker compose up first)
+# Full suite — 42 tests including 23 live-stack contract tests.
+# Requires docker compose up + a real OPENAI_API_KEY in .env.
 RAG_E2E=1 .venv/bin/pytest -q tests/
 ```
 
-Expected: **22 passed** — 12 contract-shape from
-`tests/contract/test_contract_shapes.py` + `tests/contract/test_shapes.py`,
-plus 10 /MS-{20,23,24} cases from `tests/contract/test_required_behaviors.py`:
-synchronous availability, concurrent-session isolation, malformed input
-no crash, restart persistence (MS-20); transient embed-failure on
-/turns survives, /recall returns facts when embed fails, /recall fully
+**Offline (`tests/unit/test_recall_helpers.py`, 19 tests):**
+`_canonicalise_slot` (MS-26) — alias collapse + opinion-hierarchical;
+`_parse_known_facts_block` — fixture-runner verdict helper;
+`_facts_block_relevant` (MS-25) — noise gate signals + degraded-mode
+bypass; `_format_recall_context` — provisional headers (MS-29),
+query-aware sort under tight budget (MS-23), conversation-hit
+filter (MS-25).
+
+**Live stack (`tests/contract/`, 23 tests):**
+12 contract-shape from `test_contract_shapes.py` + `test_shapes.py`;
+4 required from `test_required_behaviors.py` — synchronous availability,
+concurrent-session isolation, malformed input no crash, restart
+persistence (MS-20); 5 graceful-upstream cases — `/turns` survives
+embed blip, `/recall` returns facts when embed fails, `/recall` fully
 cold when embed fails and no memories, fixture runner aggregates
-failures, both-upstream-fail returns 503 (MS-24); query-aware memory
-ranking under tight budget (MS-23). The restart test invokes
-`docker compose restart app` via subprocess; it is auto-skipped when
-the docker CLI isn't on PATH.
+failures, both-upstream-fail returns 503 (MS-24); 1 query-aware
+memory ranking (MS-23); 1 concurrency guard for canonical-slot
+collisions (MS-27). The restart test invokes `docker compose restart
+app` via subprocess; it is auto-skipped when the docker CLI isn't on
+PATH.
 
 The recall-quality fixtures are a separate, measured eval:
 
