@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -409,9 +410,10 @@ async def delete_chat_history(
 
 # =====================================================================
 # API contract endpoints. These are the eval-facing surface.
-# Embedding, retrieval, and LLM extraction are live as of MS-17a-ii;
-# supersession (MS-18) and priority assembly with a
-# "## Known facts" section in /recall (MS-19) are the next slices.
+# Embedding, retrieval, LLM extraction, and stable-fact priority
+# assembly (`## Known facts about this user`) are live; 
+# supersession (MS-18) is the next slice and will deduplicate the
+# memory set surfaced here.
 # =====================================================================
 
 
@@ -567,59 +569,126 @@ async def _recall_candidates(
     ]
 
 
+# priority bucketing: stable user identity facts beat opinions/events
+# when the budget is tight. Lower number = higher priority.
+_MEMORY_TYPE_PRIORITY = {"fact": 0, "preference": 1, "opinion": 2, "event": 3}
+
+
+async def _fetch_active_memories(user_id: str) -> list[dict]:
+    """
+    Active typed memories for a user, ordered for `## Known facts`
+    rendering: type priority first (fact → preference → opinion → event),
+    then most-recently-updated. Plain row dicts, decoupled from the
+    /users/{id}/memories response model.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT  type, key, value
+            FROM    memories
+            WHERE   user_id = $1 AND active = TRUE
+            ORDER BY updated_at DESC, id ASC
+            """,
+            user_id,
+        )
+    out = [
+        {"type": r["type"], "key": r["key"], "value": r["value"]}
+        for r in rows
+    ]
+    out.sort(key=lambda m: _MEMORY_TYPE_PRIORITY.get(m["type"], 99))
+    return out
+
+
 def _format_recall_context(
+    memories: list[dict],
     hits: list[dict],
     max_tokens: int,
 ) -> tuple[str, list[dict]]:
     """
-    Build the `context` string and matched citations under a token budget.
-    Baseline ships only the "## Relevant from recent conversations" section;
-    "## Known facts about this user" is MS-17/19 work and is documented as
-    a known gap in README + CHANGELOG.
+    Build the `context` string and matched citations under a token
+    budget. priority: stable user facts → recent conversation
+    chunks. The `## Known facts about this user` block consumes budget
+    first; whatever budget remains is drained into `## Relevant from
+    recent conversations`.
+
+    Citations only carry `turn_id` references — memories surface in
+    the prose block but are inspectable via /users/{id}/memories so we
+    don't double-report them as citations.
     """
-    if not hits:
+    if not memories and not hits:
         return "", []
 
-    header = "## Relevant from recent conversations"
-    used = _approx_tokens(header)
-    lines: list[str] = []
+    sections: list[str] = []
+    used = 0
+
+    if memories:
+        facts_header = "## Known facts about this user"
+        used += _approx_tokens(facts_header)
+        fact_lines: list[str] = []
+        for mem in memories:
+            line = f"- {mem['key']}: {mem['value']}"
+            cost = _approx_tokens(line) + 1
+            if used + cost > max_tokens and fact_lines:
+                # : facts have priority but a runaway memory list
+                # still cannot blow past the budget.
+                break
+            used += cost
+            fact_lines.append(line)
+        if fact_lines:
+            sections.append("\n".join([facts_header, *fact_lines]))
+
     chosen: list[dict] = []
+    if hits:
+        hits_header = "## Relevant from recent conversations"
+        header_cost = _approx_tokens(hits_header)
+        hit_lines: list[str] = []
+        # Reserve header cost only if at least one hit fits.
+        for hit in hits:
+            meta = hit["metadata"]
+            snippet = _trim(hit["text"])
+            ts = meta.get("ts") or ""
+            role = meta.get("role") or "?"
+            sid = meta.get("session_id") or "?"
+            line = f"- [{ts}] ({role} {sid}) {snippet}"
+            cost = _approx_tokens(line) + 1
+            head = header_cost if not hit_lines else 0
+            if used + head + cost > max_tokens and hit_lines:
+                break
+            if used + head + cost > max_tokens:
+                # Even the first hit doesn't fit; facts win the budget.
+                break
+            used += head + cost
+            hit_lines.append(line)
+            chosen.append({
+                "turn_id": meta.get("turn_id") or "",
+                "score": hit["score"],
+                "snippet": snippet,
+            })
+        if hit_lines:
+            sections.append("\n".join([hits_header, *hit_lines]))
 
-    for hit in hits:
-        meta = hit["metadata"]
-        snippet = _trim(hit["text"])
-        ts = meta.get("ts") or ""
-        role = meta.get("role") or "?"
-        sid = meta.get("session_id") or "?"
-        line = f"- [{ts}] ({role} {sid}) {snippet}"
-        cost = _approx_tokens(line) + 1  # +1 for newline
-        if used + cost > max_tokens and lines:
-            # Budget tight; bail before exceeding 2× per the API contract.
-            break
-        used += cost
-        lines.append(line)
-        chosen.append({
-            "turn_id": meta.get("turn_id") or "",
-            "score": hit["score"],
-            "snippet": snippet,
-        })
-
-    if not lines:
+    if not sections:
         return "", []
-    context = "\n".join([header, *lines])
-    return context, chosen
+    return "\n\n".join(sections), chosen
 
 
 @router.post("/recall", response_model=RecallResponse)
 async def recall(payload: RecallRequest) -> RecallResponse:
     """
-    Cosine top-k over the turn-message index, scoped by user_id. cold
-    semantics: empty store, unknown user, or zero matches → 200 with
-    {"context": "", "citations": []}. Never errors.
+    /recall: assemble context from two layers under a token budget.
 
-    This is the baseline floor — a deliberate, defensible cosine-only
-    pipeline. Hybrid retrieval, rerank, multi-hop, and stable-fact
-    priority assembly are tracked separately and will compound on top.
+    1. Stable user facts — active rows in `memories` for `user_id`.
+    2. Query-relevant recent turns — cosine top-k over indexed messages.
+
+    priority is "stable facts → query-relevant memories → recent
+    context". Layer 2 here covers facts and recent context together via
+    the cosine pipeline; the dedicated query-relevant-memories layer
+    (embedding similarity over memory rows) is a deliberate next slice
+    once MS-18 supersession deduplicates the memory set.
+
+    cold semantics: empty store, unknown user, or zero matches → 200
+    with `{"context": "", "citations": []}`. Never errors.
     """
     if payload.user_id is None:
         # No scope = no recall. We share across same-user sessions,
@@ -627,8 +696,11 @@ async def recall(payload: RecallRequest) -> RecallResponse:
         return RecallResponse(context="", citations=[])
 
     qvec = await embed_query(payload.query)
-    hits = await _recall_candidates(qvec, payload.user_id, payload.session_id, _RECALL_TOPK)
-    context, citations = _format_recall_context(hits, payload.max_tokens)
+    memories, hits = await asyncio.gather(
+        _fetch_active_memories(payload.user_id),
+        _recall_candidates(qvec, payload.user_id, payload.session_id, _RECALL_TOPK),
+    )
+    context, citations = _format_recall_context(memories, hits, payload.max_tokens)
     return RecallResponse(
         context=context,
         citations=[Citation(**c) for c in citations],
