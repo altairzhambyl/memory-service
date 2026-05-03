@@ -149,13 +149,25 @@ End-to-end:
    sibling `key: value` document written at /turns time. Returns a
    `{memory_id: rrf_score}` map used to re-sort the facts block by
    query similarity.
-5. **Assemble**: emit the `## Known facts` block first (sorted by query
+5. **Noise gate (HGT-25)**: facts and conversation hits both gate on
+   relevance. The `## Known facts` block renders only when (memory
+   hybrid top-RRF ≥ 0.02) OR (conversation top-cosine ≥ 0.20) OR
+   (query matches a profile-allowlist regex like *"tell me about this
+   user"*). Conversation hits below cosine 0.20 are filtered out
+   entirely. Off-topic queries on a known user (§9 noise resistance)
+   return cold context — no hallucinated identity dump. The gate is
+   bypassed when `embed_query` failed (HGT-24 degraded mode) so the
+   user still gets their stable facts on a transient blip.
+6. **Assemble**: emit the `## Known facts` block first (sorted by query
    similarity DESC, with `(type_priority, updated_at DESC)` as the
    tail-sort for memories the retriever didn't score), then drain the
    remaining budget into `## Relevant from recent conversations`. Under
    tight budget, lowest-similarity facts are dropped first — irrelevant
-   ones never crowd out relevant ones.
-5. **Citations** carry `turn_id`, cosine score, and snippet (cosine
+   ones never crowd out relevant ones. Section headers are
+   *provisional*: header cost is reserved against budget but committed
+   only when at least one body line fits, so very small budgets never
+   exceed §3's "approximate, don't blow past 2×".
+7. **Citations** carry `turn_id`, cosine score, and snippet (cosine
    kept as the citation score for §3 interpretability; ordering is
    by RRF). Memories are not duplicated as citations — reviewers
    inspect them via `/users/{user_id}/memories`.
