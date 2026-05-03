@@ -1,0 +1,23 @@
+-- : query-relevant memories layer (MS-23).
+--
+-- This is a DDL-only migration. The `documents` table already discriminates
+-- rows by `metadata->>'kind'` ('turn_message' for indexed conversation,
+-- 'doc' for the legacy /ingest path) — we just promote a third value
+-- 'memory' so each active row in the `memories` table has a sibling
+-- embedding row that /recall can hybrid-rank by query similarity.
+--
+-- A SQL migration cannot create the embeddings (they require an OpenAI API
+-- call), so backfill for existing populated volumes happens via
+-- POST /admin/reembed_memories, idempotent. Fresh installs ingest going
+-- forward through the new /turns code path.
+--
+-- The existing GIN index on documents.tsv (migration 005) and the HNSW
+-- index on embeddings.embedding (migration 001) cover the new rows
+-- without any extra DDL — they don't filter on kind. The retrieval
+-- queries already include `metadata->>'kind' = ...` predicates, so
+-- planner-side selectivity is fine for our scale.
+
+-- No-op marker. Keeping this file so the migration runner records its
+-- application order and a follow-up can add a partial index here if
+-- EXPLAIN shows the planner needs it.
+SELECT 1;

@@ -197,6 +197,7 @@ class TurnIndexRow(BaseModel):
 class TurnIndexResponse(BaseModel):
     documents_count: int
     embeddings_count: int
+    memory_document_count: int = 0
     extraction_failures: int
     embed_failures: int = 0
     rows: list[TurnIndexRow]
