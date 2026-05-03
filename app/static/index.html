@@ -720,13 +720,12 @@
 
         <article class="s3-card">
           <h2>6. GET /users/{user_id}/memories — typed structured rows</h2>
-          <p class="desc">Reads the inspection endpoint. Until MS-17a-ii lands the real LLM extractor, the "Seed demo memories" button writes the ideal-extraction rows for <code>fix-berlin</code>, <code>fix-pet</code>, <code>fix-diet</code>. DELETE /users wipes these too.</p>
+          <p class="desc">Reads the inspection endpoint. After <code>Run fixture</code> in card 5, the LLM extractor (gpt-4o-mini, Structured Outputs) will have populated typed memories for each <code>fix-*</code> user. DELETE /users wipes these too.</p>
           <div class="s3-row">
             <input id="s3MemUser" placeholder="user_id" value="fix-berlin">
           </div>
           <div class="s3-actions">
             <button class="s3-action" id="s3RefreshMemBtn" type="button">Refresh memories</button>
-            <button class="s3-action ghost" id="s3SeedMemBtn" type="button">Seed demo memories</button>
           </div>
           <div class="s3-counts" id="s3MemCounts">
             <span class="s3-pill">rows: <strong>—</strong></span>
@@ -1126,7 +1125,6 @@
       fixtureTableWrap: document.querySelector("#s3FixtureTableWrap"),
       memUser: document.querySelector("#s3MemUser"),
       refreshMemBtn: document.querySelector("#s3RefreshMemBtn"),
-      seedMemBtn: document.querySelector("#s3SeedMemBtn"),
       memCounts: document.querySelector("#s3MemCounts"),
       memTableWrap: document.querySelector("#s3MemTableWrap"),
     };
@@ -1182,9 +1180,11 @@
 
     function s3RenderIndex(data) {
       const docColor = data.documents_count === data.embeddings_count ? "" : "warn";
+      const failClass = data.extraction_failures > 0 ? "warn" : "";
       s3.ixCounts.innerHTML =
         `<span class="s3-pill"><span>documents: </span><strong>${data.documents_count}</strong></span>` +
         `<span class="s3-pill ${docColor}"><span>embeddings: </span><strong>${data.embeddings_count}</strong></span>` +
+        `<span class="s3-pill ${failClass}"><span>extraction failures: </span><strong>${data.extraction_failures}</strong></span>` +
         `<span class="s3-pill"><span>shown: </span><strong>${data.rows.length}</strong></span>`;
 
       if (!data.rows.length) {
@@ -1324,11 +1324,16 @@
       const r3 = `${a.positive_passed_top3}/${a.positive_total}`;
       const noise = a.noise_total ? `${a.noise_passed}/${a.noise_total}` : "—";
       const r1Class = a.positive_total && a.positive_passed_top1 === a.positive_total ? "" : (a.positive_passed_top1 ? "" : "warn");
+      const failClass = a.extraction_failures > 0 ? "warn" : "";
+      const failBreakdown = Object.keys(a.extraction_error_modes || {}).length
+        ? " (" + Object.entries(a.extraction_error_modes).map(([k, v]) => `${escapeHtml(k)}:${v}`).join(", ") + ")"
+        : "";
       s3.fixtureAggregate.innerHTML =
         `<span class="s3-pill ${r1Class}">recall@1: <strong>${r1} (${(a.recall_at_1 * 100).toFixed(0)}%)</strong></span>` +
         `<span class="s3-pill">recall@3: <strong>${r3} (${(a.recall_at_3 * 100).toFixed(0)}%)</strong></span>` +
         `<span class="s3-pill">noise resistance: <strong>${noise}</strong></span>` +
         `<span class="s3-pill">mean top-score: <strong>${a.mean_top_score.toFixed(3)}</strong></span>` +
+        `<span class="s3-pill ${failClass}">extraction failures: <strong>${a.extraction_failures}</strong>${failBreakdown}</span>` +
         `<span class="s3-pill">elapsed: <strong>${data.elapsed_ms} ms</strong></span>`;
 
       const rowsHtml = data.probes.map((p) => {
@@ -1397,7 +1402,7 @@
         `<span class="s3-pill">rows: <strong>${rows.length}</strong></span>` +
         `<span class="s3-pill">types: <strong>${escapeHtml(typeStr)}</strong></span>`;
       if (!rows.length) {
-        s3.memTableWrap.innerHTML = '<p class="s3-empty">No memories for this user yet. Try "Seed demo memories" for a fix-* user.</p>';
+        s3.memTableWrap.innerHTML = '<p class="s3-empty">No memories for this user yet. POST a turn to <code>/turns</code>, or click "Run fixture" in card 5 to populate <code>fix-*</code> users via the LLM extractor.</p>';
         return;
       }
       const rowsHtml = rows.map((m) => `<tr>
@@ -1438,25 +1443,7 @@
       }
     }
 
-    async function s3SeedMemories() {
-      const u = s3.memUser.value.trim();
-      if (!u) return;
-      s3.seedMemBtn.disabled = true;
-      try {
-        await requestJson("/admin/seed_memories", {
-          method: "POST",
-          body: JSON.stringify({ user_id: u }),
-        });
-        await s3RefreshMemories();
-      } catch (err) {
-        s3.memCounts.innerHTML = `<span class="s3-pill warn"><strong>Seed error: ${escapeHtml(err.message)}</strong></span>`;
-      } finally {
-        s3.seedMemBtn.disabled = false;
-      }
-    }
-
     s3.refreshMemBtn.addEventListener("click", s3RefreshMemories);
-    s3.seedMemBtn.addEventListener("click", s3SeedMemories);
 
     document.querySelector("#composer").addEventListener("submit", (event) => {
       event.preventDefault();

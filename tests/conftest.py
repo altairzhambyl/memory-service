@@ -23,9 +23,11 @@ def event_loop():
 @pytest.fixture
 async def client():
     """
-    HTTPX client wired to the ASGI app. We do NOT bring up the lifespan
-    here — Epic 0 contract tests use a stub pool. Once Epic 1 lands,
-    this fixture will switch to a real Postgres test container.
+    HTTPX client wired to the ASGI app. Lifespan is NOT started here —
+    contract-shape tests use a stub pool to keep them fast and offline.
+    End-to-end synchronous-correctness coverage (post a turn → memories
+    immediately queryable) will land alongside the pytest fixture
+    harness in MS-20a-2 against the live Docker stack.
     """
     from app.main import create_app
 
