@@ -275,6 +275,21 @@
       "expected_empty_context": true
     },
     {
+      "_purpose": "MS-32 per-fact gate: query partially overlaps the user's facts (the word 'opinion' touches opinion.typescript) so the BLOCK-level relevance gate may pass — but no individual fact is genuinely relevant to quantum computing. With per-fact gate active, the typescript opinion must NOT render.",
+      "label": "noise-quantum-typescript-no-facts",
+      "query": "What is the user's opinion on quantum computing?",
+      "user_id": "fix-arc-typescript",
+      "session_id": "fix-arc-typescript-recall",
+      "max_tokens": 1024,
+      "noise": true,
+      "expected_top_score_under": 0.30,
+      "forbidden_known_facts": [
+        { "key_prefix": "opinion." },
+        { "key_prefix": "programming." },
+        { "key_prefix": "language." }
+      ]
+    },
+    {
       "label": "implicit-pet",
       "query": "Does this user have any pets?",
       "user_id": "fix-imp-pet",

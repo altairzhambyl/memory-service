@@ -261,3 +261,21 @@ Release wrap-up — что сделано / что не сделано —
 * Per-fact relevance gate. Текущий recall — query-aware ranking + budget ordering. Stricter off-topic fact gate — следующий hardening step, **MS-32**, потому что noise resistance это named eval category.
 
 Final verification: `RAG_E2E=1 pytest tests/ -q` → 42 passed. v1 + v2 → all probes PASS. Smoke `bash scripts/smoke.sh` → reference flow end-to-end. Release-ready.
+
+2026-05-03
+MS-32 — per-fact relevance gate (noise resistance hardening) — 
+Закрыт partial-overlap edge case который MS-25 explicitly не покрывал. Ранее: known user'у с typescript opinion на запрос «What is the user's opinion on quantum computing?» rendered весь identity dump потому что block-level gate clearил через token-overlap «opinion». Now: per-fact gate отдельный от block-level — для каждой memory отдельно проверяется query-similarity threshold.
+**Discovery в процессе:** первая реализация использовала RRF threshold 0.025, но это сломалось — RRF rank-1 from one retriever всегда ≈ 0.0164, не отражает actual relevance. Same RRF на «pet.name=Biscuit для запроса о dogs» (relevant) и «opinion.typescript для запроса о quantum» (irrelevant). Refactor: `_recall_memory_candidates` теперь возвращает `dict[str, dict]` с обоими `rrf` (для sort) и `cosine` (для per-fact gate). Threshold = 0.25 на cosine — отделяет relevant from irrelevant без false positives.
+**Implementation:**
+* `_RECALL_FACT_INCLUSION_MIN_COSINE = 0.25` константа документирована в `routes.py`.
+* `_recall_memory_candidates` returns `{memory_id: {rrf, cosine}}` map; cosine берётся из cosine retrieval row (`1 - distance`).
+* `_format_recall_context` sort key uses `rrf` (existing MS-23 ordering); per-fact gate filter использует `cosine`.
+* Profile-query bypass (`/about (this )?user|tell me about|...`) preserved.
+* MS-24 degraded-mode bypass (`memory_scores=None`) preserved.
+**v2 fixture:** новая probe `noise-quantum-typescript-no-facts` — fix-arc-typescript user, query «What is the user's opinion on quantum computing?», `forbidden_known_facts` covers `opinion.* / programming.* / language.*`. Этот probe explicitly падал бы без MS-32 (typescript opinion bleed'ил в Known facts через token-overlap «opinion»).
+**3 offline unit tests:** `test_format_per_fact_gate_drops_low_cosine_memories`, `test_format_per_fact_gate_bypassed_for_profile_query`, `test_format_per_fact_gate_bypassed_in_degraded_mode`. Все три PASS на дет. helpers.
+**Verification:**
+* v1 fixture: recall@1=6/6, mean=0.3557, без регрессии.
+* v2 fixture: 10 probes ALL PASS, multihop@1=1/1, facts=6/6, forb=0, super=1/1, noise=1/1.
+* Offline tests: 22/22 (19 prior + 3 new MS-32).
+* MS-32 → Done. noise-resistance hardening complete. Codex audit triage 8/8 closed (включая MS-32 который сами зарегистрировали как tracked hardening).
