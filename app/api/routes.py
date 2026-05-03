@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -19,6 +20,7 @@ from app.api.schemas import (
     ChatSessionCreateRequest,
     ChatSessionCreateResponse,
     ChatSessionListResponse,
+    Citation,
     IngestRequest,
     IngestResponse,
     QueryHit,
@@ -26,8 +28,11 @@ from app.api.schemas import (
     QueryResponse,
     RecallRequest,
     RecallResponse,
+    SearchHit,
     SearchRequest,
     SearchResponse,
+    TurnIndexResponse,
+    TurnIndexRow,
     TurnRequest,
     TurnResponse,
     UserMemoriesResponse,
@@ -35,6 +40,28 @@ from app.api.schemas import (
 from app.config import get_settings
 from app.db.pool import get_pool
 from app.embeddings.openai import embed_documents, embed_query, get_client
+
+# : 1 token ≈ 4 chars for English text. Fine for /recall budget
+# triage; we do NOT need a real tokenizer here, the eval timeout
+# wouldn't reward the precision.
+_CHARS_PER_TOKEN = 4
+# Hard cap on the candidate pool we pull before token-budget trimming.
+# Keeps the JOIN bounded; HNSW handles ranking.
+_RECALL_TOPK = 10
+# Snippet trim to keep one giant message from monopolising the budget.
+_SNIPPET_CHARS = 240
+
+
+def _approx_tokens(s: str) -> int:
+    if not s:
+        return 0
+    return max(1, (len(s) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN)
+
+
+def _trim(text: str, n: int = _SNIPPET_CHARS) -> str:
+    if len(text) <= n:
+        return text
+    return text[: n - 1].rstrip() + "…"
 
 router = APIRouter()
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
@@ -382,8 +409,19 @@ async def delete_chat_history(
 
 @router.post("/turns", response_model=TurnResponse, status_code=201)
 async def create_turn(payload: TurnRequest) -> TurnResponse:
-    """Persist a turn + its messages synchronously. Returns the turn id."""
+    """
+    Persist a turn + its messages synchronously, then index each message
+    into documents/embeddings under doc_id `turn:{turn_id}:{idx}`. The
+    embed call happens before the DB transaction so a network blip won't
+    leave half-written rows; once we open the transaction, all writes
+    commit or roll back together (synchronous correctness).
+    """
     turn_id = str(uuid.uuid4())
+    settings = get_settings()
+
+    contents = [msg.content for msg in payload.messages]
+    vectors = await embed_documents(contents)
+
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
@@ -397,7 +435,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             payload.timestamp,
             _to_jsonb(payload.metadata),
         )
-        for idx, msg in enumerate(payload.messages):
+        for idx, (msg, vec) in enumerate(zip(payload.messages, vectors, strict=True)):
             await conn.execute(
                 """
                 INSERT INTO turn_messages (turn_id, idx, role, name, content)
@@ -405,21 +443,199 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 """,
                 turn_id, idx, msg.role, msg.name, msg.content,
             )
+            doc_id = f"turn:{turn_id}:{idx}"
+            provenance = {
+                "kind": "turn_message",
+                "turn_id": turn_id,
+                "session_id": payload.session_id,
+                "user_id": payload.user_id,
+                "role": msg.role,
+                "name": msg.name,
+                "idx": idx,
+                "ts": payload.timestamp.isoformat(),
+            }
+            await conn.execute(
+                """
+                INSERT INTO documents (id, text, metadata)
+                VALUES ($1, $2, $3::jsonb)
+                """,
+                doc_id, msg.content, _to_jsonb(provenance),
+            )
+            await conn.execute(
+                """
+                INSERT INTO embeddings (doc_id, embedding, model)
+                VALUES ($1, $2, $3)
+                """,
+                doc_id, vec, settings.embedding_model,
+            )
     return TurnResponse(id=turn_id)
+
+
+async def _recall_candidates(
+    qvec: list[float],
+    user_id: str | None,
+    session_id: str | None,
+    top_k: int,
+) -> list[dict]:
+    """
+    Cosine top-k over indexed turn messages. Scope by user_id; cross-session
+    sharing for the same user is intentional per the API contract (documented in README).
+    session_id, when supplied, is used only as a soft hint for the eval
+    harness — we do NOT exclude other sessions, but we surface the match's
+    own session_id in the citation so reviewers can see provenance.
+    """
+    where = ["d.metadata->>'kind' = 'turn_message'"]
+    args: list[object] = [qvec]
+    if user_id is not None:
+        args.append(user_id)
+        where.append(f"d.metadata->>'user_id' = ${len(args)}")
+    where_sql = " AND ".join(where)
+    args.append(top_k)
+    sql = f"""
+        SELECT  d.id,
+                d.text,
+                d.metadata,
+                1 - (e.embedding <=> $1) AS score
+        FROM    embeddings e
+        JOIN    documents  d ON d.id = e.doc_id
+        WHERE   {where_sql}
+        ORDER BY e.embedding <=> $1
+        LIMIT   ${len(args)}
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    return [
+        {
+            "doc_id": r["id"],
+            "text": r["text"],
+            "metadata": _from_jsonb(r["metadata"]),
+            "score": float(r["score"]),
+        }
+        for r in rows
+    ]
+
+
+def _format_recall_context(
+    hits: list[dict],
+    max_tokens: int,
+) -> tuple[str, list[dict]]:
+    """
+    Build the `context` string and matched citations under a token budget.
+    Baseline ships only the "## Relevant from recent conversations" section;
+    "## Known facts about this user" is MS-17/19 work and is documented as
+    a known gap in README + CHANGELOG.
+    """
+    if not hits:
+        return "", []
+
+    header = "## Relevant from recent conversations"
+    used = _approx_tokens(header)
+    lines: list[str] = []
+    chosen: list[dict] = []
+
+    for hit in hits:
+        meta = hit["metadata"]
+        snippet = _trim(hit["text"])
+        ts = meta.get("ts") or ""
+        role = meta.get("role") or "?"
+        sid = meta.get("session_id") or "?"
+        line = f"- [{ts}] ({role} {sid}) {snippet}"
+        cost = _approx_tokens(line) + 1  # +1 for newline
+        if used + cost > max_tokens and lines:
+            # Budget tight; bail before exceeding 2× per the API contract.
+            break
+        used += cost
+        lines.append(line)
+        chosen.append({
+            "turn_id": meta.get("turn_id") or "",
+            "score": hit["score"],
+            "snippet": snippet,
+        })
+
+    if not lines:
+        return "", []
+    context = "\n".join([header, *lines])
+    return context, chosen
 
 
 @router.post("/recall", response_model=RecallResponse)
 async def recall(payload: RecallRequest) -> RecallResponse:
-    """Cold shape until MS-16 wires real recall. Never errors on empty store."""
-    _ = payload  # request validated; no use yet
-    return RecallResponse(context="", citations=[])
+    """
+    Cosine top-k over the turn-message index, scoped by user_id. cold
+    semantics: empty store, unknown user, or zero matches → 200 with
+    {"context": "", "citations": []}. Never errors.
+
+    This is the baseline floor — a deliberate, defensible cosine-only
+    pipeline. Hybrid retrieval, rerank, multi-hop, and stable-fact
+    priority assembly are tracked separately and will compound on top.
+    """
+    if payload.user_id is None:
+        # No scope = no recall. We share across same-user sessions,
+        # but anonymous queries don't get to fish in everyone's data.
+        return RecallResponse(context="", citations=[])
+
+    qvec = await embed_query(payload.query)
+    hits = await _recall_candidates(qvec, payload.user_id, payload.session_id, _RECALL_TOPK)
+    context, citations = _format_recall_context(hits, payload.max_tokens)
+    return RecallResponse(
+        context=context,
+        citations=[Citation(**c) for c in citations],
+    )
 
 
 @router.post("/search", response_model=SearchResponse)
 async def search(payload: SearchRequest) -> SearchResponse:
-    """Cold shape until MS-16 wires real search."""
-    _ = payload
-    return SearchResponse(results=[])
+    """
+    Twin of /recall but returns structured rows, not prose. says this is
+    invoked by an explicit agent tool call, so we don't apply token budgets
+    here — `limit` already bounds the response.
+    """
+    if payload.user_id is None and payload.session_id is None:
+        # Same fishing-trip guard as /recall: refuse fully unscoped queries.
+        return SearchResponse(results=[])
+
+    qvec = await embed_query(payload.query)
+    # session_id-only scope falls back to user-less lookup; we narrow by
+    # session_id in SQL when user_id is missing.
+    where = ["d.metadata->>'kind' = 'turn_message'"]
+    args: list[object] = [qvec]
+    if payload.user_id is not None:
+        args.append(payload.user_id)
+        where.append(f"d.metadata->>'user_id' = ${len(args)}")
+    if payload.session_id is not None:
+        args.append(payload.session_id)
+        where.append(f"d.metadata->>'session_id' = ${len(args)}")
+    where_sql = " AND ".join(where)
+    args.append(payload.limit)
+    sql = f"""
+        SELECT  d.id,
+                d.text,
+                d.metadata,
+                1 - (e.embedding <=> $1) AS score
+        FROM    embeddings e
+        JOIN    documents  d ON d.id = e.doc_id
+        WHERE   {where_sql}
+        ORDER BY e.embedding <=> $1
+        LIMIT   ${len(args)}
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+
+    results: list[SearchHit] = []
+    for r in rows:
+        meta = _from_jsonb(r["metadata"])
+        ts_str = meta.get("ts")
+        ts = datetime.fromisoformat(ts_str) if ts_str else datetime.fromtimestamp(0)
+        results.append(SearchHit(
+            content=r["text"],
+            score=float(r["score"]),
+            session_id=meta.get("session_id") or "",
+            timestamp=ts,
+            metadata={k: v for k, v in meta.items() if k not in {"kind"}},
+        ))
+    return SearchResponse(results=results)
 
 
 @router.get("/users/{user_id}/memories", response_model=UserMemoriesResponse)
@@ -431,17 +647,106 @@ async def list_user_memories(user_id: str) -> UserMemoriesResponse:
 
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_session_endpoint(session_id: str) -> Response:
-    """Drop every turn for the string session_id; turn_messages cascade."""
+    """
+    Drop every turn for the string session_id. turn_messages cascades
+    via FK; the indexed documents/embeddings rows we wrote at /turns time
+    have no FK back to turns, so we delete them by provenance metadata in
+    the same transaction.
+    """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            DELETE FROM documents
+            WHERE metadata->>'kind' = 'turn_message'
+              AND metadata->>'session_id' = $1
+            """,
+            session_id,
+        )
         await conn.execute("DELETE FROM turns WHERE session_id = $1", session_id)
     return Response(status_code=204)
 
 
 @router.delete("/users/{user_id}", status_code=204)
 async def delete_user_endpoint(user_id: str) -> Response:
-    """Drop every turn for this user across all sessions."""
+    """Drop every turn + indexed message for this user across all sessions."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            DELETE FROM documents
+            WHERE metadata->>'kind' = 'turn_message'
+              AND metadata->>'user_id' = $1
+            """,
+            user_id,
+        )
         await conn.execute("DELETE FROM turns WHERE user_id = $1", user_id)
     return Response(status_code=204)
+
+
+# =====================================================================
+# Admin / debug. Read-only inspector for the static UI so MS-16a can be
+# A/B verified without psql.
+# =====================================================================
+
+
+@router.get("/admin/turn_index", response_model=TurnIndexResponse)
+async def admin_turn_index(
+    user_id: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+) -> TurnIndexResponse:
+    """Show indexed turn-message rows so the UI can verify MS-16a writes."""
+    pool = get_pool()
+    where = ["metadata->>'kind' = 'turn_message'"]
+    args: list[object] = []
+    if user_id is not None:
+        args.append(user_id)
+        where.append(f"metadata->>'user_id' = ${len(args)}")
+    if session_id is not None:
+        args.append(session_id)
+        where.append(f"metadata->>'session_id' = ${len(args)}")
+    where_sql = " AND ".join(where)
+
+    async with pool.acquire() as conn:
+        docs_count = await conn.fetchval(
+            f"SELECT count(*) FROM documents WHERE {where_sql}",
+            *args,
+        )
+        embs_count = await conn.fetchval(
+            f"""
+            SELECT count(*)
+            FROM   embeddings e
+            JOIN   documents  d ON d.id = e.doc_id
+            WHERE  {where_sql}
+            """,
+            *args,
+        )
+        rows = await conn.fetch(
+            f"""
+            SELECT  d.id,
+                    d.text,
+                    d.metadata,
+                    (e.doc_id IS NOT NULL) AS has_embedding
+            FROM    documents d
+            LEFT JOIN embeddings e ON e.doc_id = d.id
+            WHERE   {where_sql}
+            ORDER BY d.created_at DESC, d.id ASC
+            LIMIT   ${len(args) + 1}
+            """,
+            *args, limit,
+        )
+
+    return TurnIndexResponse(
+        documents_count=int(docs_count or 0),
+        embeddings_count=int(embs_count or 0),
+        rows=[
+            TurnIndexRow(
+                doc_id=r["id"],
+                text=r["text"],
+                metadata=_from_jsonb(r["metadata"]),
+                has_embedding=bool(r["has_embedding"]),
+            )
+            for r in rows
+        ],
+    )

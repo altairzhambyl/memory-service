@@ -181,3 +181,20 @@ class UserMemory(BaseModel):
 
 class UserMemoriesResponse(BaseModel):
     memories: list[UserMemory]
+
+
+# ---------- Admin / debug: GET /admin/turn_index ----------
+# Read-only inspector so the static UI can show the turn index
+# without requiring psql access on the host machine.
+
+class TurnIndexRow(BaseModel):
+    doc_id: str
+    text: str
+    metadata: dict[str, Any]
+    has_embedding: bool
+
+
+class TurnIndexResponse(BaseModel):
+    documents_count: int
+    embeddings_count: int
+    rows: list[TurnIndexRow]
