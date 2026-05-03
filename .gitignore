@@ -17,3 +17,6 @@ htmlcov/
 .vscode/
 postgres-data/
 uv.lock
+
+# Private — Higgsfield-supplied technical spec, not for public submission.
+CLAUDE.md

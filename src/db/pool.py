@@ -6,8 +6,8 @@ from pathlib import Path
 import asyncpg
 from pgvector.asyncpg import register_vector
 
-from app.config import Settings
-from app.obs.logging import get_logger
+from src.config import Settings
+from src.obs.logging import get_logger
 
 log = get_logger(__name__)
 

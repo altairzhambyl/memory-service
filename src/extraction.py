@@ -29,10 +29,10 @@ from openai import (
 )
 from pydantic import BaseModel, ValidationError
 
-from app.api.schemas import TurnMessage
-from app.config import get_settings
-from app.embeddings.openai import get_client
-from app.obs.logging import get_logger
+from src.api.schemas import TurnMessage
+from src.config import get_settings
+from src.embeddings.openai import get_client
+from src.obs.logging import get_logger
 
 log = get_logger(__name__)
 

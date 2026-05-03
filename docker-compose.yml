@@ -38,7 +38,7 @@ services:
     ports:
       - "8080:8080"
     # Live-mount recall fixtures so probe-set edits don't need a rebuild.
-    # Backend code lives inside the image; for app/ changes use the
+    # Backend code lives inside the image; for src/ changes use the
     # uvicorn --reload local workflow described in the README. The
     # static UI lives on the `with-ui` branch — main is service-only.
     volumes:

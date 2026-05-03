@@ -3,7 +3,8 @@
 A Dockerised memory service for an AI agent. Ingests conversation turns,
 extracts typed structured memories, and answers recall queries with a
 priority-assembled context. Implements the §3 HTTP contract from the
-Higgsfield AI Engineering Challenge brief (`CLAUDE.md`).
+Higgsfield AI Engineering Challenge brief (private spec; this repo
+references it via §-numbers throughout).
 
 > **Branches.** `main` is the **service-only** build — only the §3
 > HTTP surface, no static UI. Use this for an agent or eval that
@@ -56,8 +57,7 @@ Reviewers asked for a memory layer that an AI agent can sit on top of:
 write completed conversation turns to it, query it for relevant
 context on the next turn, and trust that what comes back is
 **structured, current, and on-topic**. The brief explicitly disqualifies
-"raw chunks in, top-k cosine out" as a passing solution
-(`CLAUDE.md` §10).
+"raw chunks in, top-k cosine out" as a passing solution (§10).
 
 This implementation answers each scored category with a deliberate
 mechanism, not a default:
@@ -81,7 +81,7 @@ mechanism, not a default:
 
 ```
                      ┌──────────────────────────────────────────┐
-                     │             FastAPI (app/api)            │
+                     │             FastAPI (src/api)            │
                      │ ┌──────────────────────────────────────┐ │
        POST /turns   │ │ /turns   /recall   /search           │ │
        ─────────────▶│ │ /users/{id}/memories                 │ │
@@ -214,7 +214,7 @@ partial unique index for §4.1 supersession concurrency).
 
 ## Extraction pipeline (§4.2)
 
-`app/extraction.py` calls `client.chat.completions.parse` with a
+`src/extraction.py` calls `client.chat.completions.parse` with a
 Pydantic `ExtractionResponse` schema (OpenAI Structured Outputs). The
 model returns JSON validated against the schema server-side — no
 custom parser, no `json_object` mode failures, no schema drift between
@@ -351,7 +351,11 @@ graceful-upstream paths (HGT-24); a sixth covers concurrency (HGT-27).
 
 ```
 memory-service/
-├── app/
+├── README.md                   # architecture, backing store, recall, tradeoffs
+├── CHANGELOG.md                # iteration history per §6 (Russian)
+├── docker-compose.yml          # db + app service, named volume `rag-db-data`
+├── Dockerfile                  # service container; runs `uvicorn src.main:app`
+├── src/                        # service code
 │   ├── main.py                 # FastAPI lifespan + DB pool + OpenAI client
 │   ├── api/
 │   │   ├── routes.py           # §3 contract + admin endpoints
@@ -362,15 +366,11 @@ memory-service/
 │   └── obs/logging.py          # structlog JSON
 ├── migrations/                 # 001_init … 007_canonical_slots
 ├── fixtures/recall/            # v1 (easy floor) + v2 (§9 stress probes)
-├── scripts/smoke.sh            # §3 reference smoke flow
 ├── tests/
 │   ├── unit/                   # offline pure-helper tests (no Docker)
 │   └── contract/               # live-stack contract tests (RAG_E2E=1)
-├── docker-compose.yml          # db + app, named volume `rag-db-data`
-├── Dockerfile
-├── .env.example
-├── CHANGELOG.md                # iteration log + decision rationale (Russian)
-└── CLAUDE.md                   # canonical Tech Reqs (§-numbered)
+├── scripts/smoke.sh            # §3 reference smoke flow
+└── .env.example                # OPENAI_API_KEY + Postgres knobs
 ```
 
 ---
@@ -438,7 +438,6 @@ curl -sX POST http://localhost:8080/admin/run_fixture \
 
 ## What does not ship
 
-- `app/ → src/` rename. CLAUDE.md §13 explicitly permits `app/` per Python convention.
 - Async/background re-embed or re-slot jobs. Out of scope per §12.
 - LLM-judge canonicalisation. Deterministic slot map is sufficient on the current fixture; see [HGT-37 ADRs](https://linear.app/hgtz/issue/HGT-37) for revisit criteria.
 - Cross-encoder reranker (Cohere `rerank-3` / local cross-encoder). Tracked as [HGT-35](https://linear.app/hgtz/issue/HGT-35); only meaningful with a `COHERE_API_KEY`.
@@ -448,10 +447,12 @@ curl -sX POST http://localhost:8080/admin/run_fixture \
 
 ## Iteration log
 
-`CHANGELOG.md` (Russian) is the per-decision log — every dated entry
-cites the §-section it addresses and records measured deltas.
-14 metric-bearing entries covering HGT-14 through HGT-32. The brief
-weights iteration history (§6, §10) — read it for the *why*.
+`CHANGELOG.md` (Russian) is the per-decision log — each entry follows
+a six-part template (Проблема / Ход мыслей / Рассмотренные варианты /
+Причина выбора / Результат / Дальше) and cites the §-section of the
+challenge brief it addresses. The brief weights iteration history
+(§6, §10) — read CHANGELOG for the *why* behind every choice this
+README documents structurally.
 
-`CLAUDE.md` is the canonical technical specification supplied with the
-challenge. The README and CHANGELOG both cite §-numbers from it.
+The challenge brief itself (referenced as `§N` throughout this README
+and CHANGELOG) is private and not committed to this repo.

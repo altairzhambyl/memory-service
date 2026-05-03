@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir \
         "pydantic>=2.9.0" "pydantic-settings>=2.5.0" \
         "openai>=1.54.0" "structlog>=24.4.0"
 
-COPY --chown=app:app app ./app
+COPY --chown=app:app src ./src
 COPY --chown=app:app migrations ./migrations
 COPY --chown=app:app fixtures ./fixtures
 
@@ -31,4 +31,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=10 \
     CMD curl -fsS http://localhost:8080/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
