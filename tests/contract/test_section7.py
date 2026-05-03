@@ -60,6 +60,15 @@ def _post_turn(session_id: str, user_id: str | None, content: str) -> str:
     return r.json()["id"]
 
 
+def _active_pet_values(user_id: str) -> set[str]:
+    mems = httpx.get(f"{BASE}/users/{user_id}/memories", timeout=10).json()["memories"]
+    return {
+        m["value"].lower()
+        for m in mems
+        if m["active"] and m["key"].startswith("pet")
+    }
+
+
 def _inject_embed_failure(count: int, error: str = "connection") -> None:
     """Test-only: load N forced embed failures into the running app."""
     r = httpx.post(
@@ -152,56 +161,127 @@ def test_concurrent_sessions_isolated():
         httpx.delete(f"{BASE}/users/{uid_b}", timeout=10)
 
 
+def test_multiple_pet_names_remain_active():
+    """Regression: `pet.name` is multi-entity, so adding a dog must not
+    supersede an existing cat.
+    """
+    uid = _unique("user-pets")
+    try:
+        for _ in range(3):
+            _post_turn(_unique("sess-cat"), uid, "I have a cat named Mochi.")
+            if "mochi" in _active_pet_values(uid):
+                break
+        else:
+            pytest.skip("OpenAI extraction did not produce the prerequisite Mochi memory")
+
+        for _ in range(3):
+            _post_turn(_unique("sess-dog"), uid, "I also have a dog named Biscuit.")
+            if "biscuit" in _active_pet_values(uid):
+                break
+        else:
+            pytest.skip("OpenAI extraction did not produce the prerequisite Biscuit memory")
+
+        mems = httpx.get(f"{BASE}/users/{uid}/memories", timeout=10).json()["memories"]
+        active_pet_values = _active_pet_values(uid)
+        assert "mochi" in active_pet_values, mems
+        assert "biscuit" in active_pet_values, mems
+    finally:
+        httpx.delete(f"{BASE}/users/{uid}", timeout=10)
+
+
+def test_delete_superseding_session_reactivates_previous_fact():
+    """Regression: deleting the active session should promote the prior
+    current fact instead of leaving the slot with no active row.
+    """
+    uid = _unique("user-city")
+    s1 = _unique("sess-city-a")
+    s2 = _unique("sess-city-b")
+    s3 = _unique("sess-city-c")
+    try:
+        _post_turn(s1, uid, "I live in Seattle.")
+        _post_turn(s2, uid, "Actually, I moved to Austin.")
+        _post_turn(s3, uid, "Update: I now live in Portland.")
+
+        r = httpx.delete(f"{BASE}/sessions/{s3}", timeout=10)
+        assert r.status_code == 204
+
+        mems = httpx.get(f"{BASE}/users/{uid}/memories", timeout=10).json()["memories"]
+        active_city_values = {
+            m["value"].lower()
+            for m in mems
+            if m["active"] and ("city" in m["key"] or "location" in m["key"])
+        }
+        assert "austin" in active_city_values, mems
+        assert "portland" not in active_city_values, mems
+    finally:
+        httpx.delete(f"{BASE}/users/{uid}", timeout=10)
+
+
 def test_malformed_input_no_crash():
     """§5: bad JSON, missing fields, oversized payloads, unicode
     oddities — all must yield 4xx and the service stays up.
     """
     cases = [
         # bad JSON body
-        ("post-bad-json", lambda: httpx.post(
-            f"{BASE}/turns",
-            content=b"{not json",
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )),
+        (
+            "post-bad-json",
+            lambda: httpx.post(
+                f"{BASE}/turns",
+                content=b"{not json",
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            ),
+        ),
         # missing required field (messages)
-        ("post-missing-fields", lambda: httpx.post(
-            f"{BASE}/turns",
-            json={"session_id": "x", "user_id": "u", "timestamp": "2026-05-03T10:00:00Z"},
-            timeout=10,
-        )),
+        (
+            "post-missing-fields",
+            lambda: httpx.post(
+                f"{BASE}/turns",
+                json={"session_id": "x", "user_id": "u", "timestamp": "2026-05-03T10:00:00Z"},
+                timeout=10,
+            ),
+        ),
         # wrong type — messages should be list, not string
-        ("post-wrong-type", lambda: httpx.post(
-            f"{BASE}/turns",
-            json={
-                "session_id": "x",
-                "user_id": "u",
-                "messages": "not-a-list",
-                "timestamp": "2026-05-03T10:00:00Z",
-            },
-            timeout=10,
-        )),
+        (
+            "post-wrong-type",
+            lambda: httpx.post(
+                f"{BASE}/turns",
+                json={
+                    "session_id": "x",
+                    "user_id": "u",
+                    "messages": "not-a-list",
+                    "timestamp": "2026-05-03T10:00:00Z",
+                },
+                timeout=10,
+            ),
+        ),
         # unicode + control characters in content (must NOT crash)
-        ("post-unicode-noise", lambda: httpx.post(
-            f"{BASE}/turns",
-            json={
-                "session_id": _unique("sess-u"),
-                "user_id": _unique("user-u"),
-                "messages": [
-                    {"role": "user", "content": "hello   \U0001F600 ‮ RTL"},
-                    {"role": "assistant", "content": "ok"},
-                ],
-                "timestamp": "2026-05-03T10:00:00Z",
-                "metadata": {},
-            },
-            timeout=60,
-        )),
+        (
+            "post-unicode-noise",
+            lambda: httpx.post(
+                f"{BASE}/turns",
+                json={
+                    "session_id": _unique("sess-u"),
+                    "user_id": _unique("user-u"),
+                    "messages": [
+                        {"role": "user", "content": "hello   \U0001f600 ‮ RTL"},
+                        {"role": "assistant", "content": "ok"},
+                    ],
+                    "timestamp": "2026-05-03T10:00:00Z",
+                    "metadata": {},
+                },
+                timeout=60,
+            ),
+        ),
         # /recall with missing query
-        ("recall-missing-query", lambda: httpx.post(
-            f"{BASE}/recall",
-            json={"session_id": "x", "max_tokens": 100},
-            timeout=10,
-        )),
+        (
+            "recall-missing-query",
+            lambda: httpx.post(
+                f"{BASE}/recall",
+                json={"session_id": "x", "max_tokens": 100},
+                timeout=10,
+            ),
+        ),
     ]
     for label, call in cases:
         r = call()
@@ -235,8 +315,11 @@ def test_restart_persistence():
         clean_env = {k: v for k, v in os.environ.items() if v}
         result = subprocess.run(
             ["docker", "compose", "restart", "app"],
-            capture_output=True, text=True, timeout=60,
-            cwd=project_root, env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=project_root,
+            env=clean_env,
         )
         if result.returncode != 0:
             pytest.skip(f"docker compose restart failed: {result.stderr.strip()}")
@@ -385,7 +468,7 @@ def test_fixture_runner_aggregates_failures():
                 timeout=10,
             ).json()
             total_embed_failures += idx["embed_failures"]
-        assert total_embed_failures >= 1, f"no embed_error markers found, expected ≥1"
+        assert total_embed_failures >= 1, "no embed_error markers found, expected ≥1"
     finally:
         _clear_injected_failures()
 
@@ -455,8 +538,7 @@ def test_recall_query_aware_memory_ranking():
         # both employment and diet namespaces. The LLM extracts both
         # batches synchronously inside the /turns transaction.
         _post_turn(sid, uid, "I work at Notion as a product manager.")
-        _post_turn(sid, uid,
-                   "I'm vegetarian, allergic to shellfish, and don't drink coffee.")
+        _post_turn(sid, uid, "I'm vegetarian, allergic to shellfish, and don't drink coffee.")
 
         # Verify both fact families landed before stressing the ranker.
         mem = httpx.get(f"{BASE}/users/{uid}/memories", timeout=10).json()
@@ -501,9 +583,7 @@ def test_recall_query_aware_memory_ranking():
         diet_keys = {"diet.style", "allergy", "beverage.coffee"}
         employment_keys = {"employment.company", "employment.role"}
         diet_positions = [i for i, k in enumerate(ordered_keys) if k in diet_keys]
-        employment_positions = [
-            i for i, k in enumerate(ordered_keys) if k in employment_keys
-        ]
+        employment_positions = [i for i, k in enumerate(ordered_keys) if k in employment_keys]
         assert diet_positions, f"no diet fact in block: {ordered_keys}"
         # If any employment fact appears, every one must come AFTER
         # every diet fact — the query-aware signal.
@@ -559,13 +639,17 @@ def test_concurrent_turns_to_same_slot_no_double_active():
     try:
         results: list = [None, None]
         ta = threading.Thread(
-            target=post, args=(sid_a, "I work at Stripe as a payments engineer.", results, 0),
+            target=post,
+            args=(sid_a, "I work at Stripe as a payments engineer.", results, 0),
         )
         tb = threading.Thread(
-            target=post, args=(sid_b, "I just started at Notion as a PM.", results, 1),
+            target=post,
+            args=(sid_b, "I just started at Notion as a PM.", results, 1),
         )
-        ta.start(); tb.start()
-        ta.join(); tb.join()
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
 
         # Both must complete with 201; concurrent failures aren't acceptable
         # under §5 hard constraints.

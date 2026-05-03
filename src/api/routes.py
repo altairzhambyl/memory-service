@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import Path as ApiPath
 
 from src.api.schemas import (
     ChatDeleteResponse,
@@ -69,19 +70,23 @@ _RECALL_TOPK = 10
 # and we want non-zero similarity scores on as many of them as possible.
 _MEMORY_RECALL_TOPK = 50
 # Per-retriever candidate pool for the hybrid fuse. Each retriever (cosine
-# and BM25) returns up to this many docs; RRF merges and re-ranks them.
+# and Postgres FTS) returns up to this many docs; RRF merges and re-ranks them.
 _HYBRID_POOL = 30
+# RRF dampening constant. 60 is the value from Cormack-Buettcher-Clarke
+# (2009) and now the de-facto default; we explicitly cite it in the
+# CHANGELOG so a reviewer doesn't have to ask "why 60?".
+_RRF_K = 60
 # §9 noise-resistance gates (HGT-25). Facts block renders only when the
 # query is on-topic for this user — at least one of:
 #   * memory hybrid retrieval returns a row with RRF ≥ τ_mem
 #       (one retriever agreeing on rank 1 ⇒ RRF ≈ 1/61 ≈ 0.0164;
-#       two agreeing ⇒ ~0.033 — τ=0.02 is "≥1 retriever scored it").
+#       two agreeing ⇒ ~0.033 — τ=0.016 is "rank-1 from one retriever").
 #   * conversation cosine top hit ≥ τ_conv. Empirically v2 noise probe
 #     ("opinion on quantum computing") tops at 0.25 on a typescript
 #     user; positive identity probes sit ≥0.30. Threshold 0.27 splits.
 #   * query matches the profile-allowlist regex
 #     ("tell me about this user", "who is …", "what do you know about").
-_RECALL_FACTS_GATE_MEMORY_RRF = 0.02
+_RECALL_FACTS_GATE_MEMORY_RRF = 1.0 / (_RRF_K + 1)
 # HGT-32 per-fact inclusion threshold. The block-level gate above
 # decides "should the facts block render at all?"; this threshold
 # decides "should THIS particular fact appear inside the block?".
@@ -102,16 +107,11 @@ _RECALL_FACT_INCLUSION_MIN_COSINE = 0.25
 _RECALL_FACTS_GATE_CONVERSATION_COSINE = 0.20
 _RECALL_CONVERSATION_MIN_SCORE = 0.20
 # Compiled module-level so it doesn't recompile per /recall.
-import re as _re  # noqa: E402 — kept local to retrieval section
-_RECALL_PROFILE_QUERY_RE = _re.compile(
+_RECALL_PROFILE_QUERY_RE = re.compile(
     r"\b(about (this )?user|tell me about|who is|"
     r"what do (?:we|you) know about|user'?s? profile)\b",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
-# RRF dampening constant. 60 is the value from Cormack-Buettcher-Clarke
-# (2009) and now the de-facto default; we explicitly cite it in the
-# CHANGELOG so a reviewer doesn't have to ask "why 60?".
-_RRF_K = 60
 # Snippet trim to keep one giant message from monopolising the budget.
 _SNIPPET_CHARS = 240
 
@@ -127,6 +127,7 @@ def _trim(text: str, n: int = _SNIPPET_CHARS) -> str:
         return text
     return text[: n - 1].rstrip() + "…"
 
+
 router = APIRouter()
 
 
@@ -135,8 +136,9 @@ router = APIRouter()
 # when the LLM picked a different key namespace. Rules are deterministic
 # and intentionally narrow — we only collapse the 5 categories where
 # variance is observed against v1+v2 fixtures (employment, location,
-# diet, beverage, allergy). Multi-entity users (two pets, two children)
-# keep `slot = key` so they don't collapse onto each other.
+# diet, beverage, allergy). Multi-entity facts (two pets, two children)
+# include a value fragment in their row slot so they do not collapse
+# onto each other.
 _SLOT_ALIASES: dict[str, str] = {
     # current employer
     "employment.company": "employment.current_company",
@@ -171,6 +173,28 @@ _SLOT_ALIASES: dict[str, str] = {
     "drinks.coffee": "beverage.coffee",
 }
 
+_MULTI_ENTITY_KEYS = {
+    "pet.name",
+    "pets.name",
+    "child.name",
+    "children.name",
+    "family.child_name",
+    "vehicle.name",
+    "vehicles.name",
+    "car.name",
+    "cars.name",
+}
+_MULTI_ENTITY_PREFIXES = (
+    "pet",
+    "pets",
+    "child",
+    "children",
+    "vehicle",
+    "vehicles",
+    "car",
+    "cars",
+)
+
 
 def _canonicalise_slot(key: str) -> str:
     """
@@ -191,6 +215,38 @@ def _canonicalise_slot(key: str) -> str:
         if len(parts) >= 2:
             return ".".join(parts[:2])
     return key
+
+
+def _normalise_slot_value(value: str) -> str:
+    """Stable, bounded value fragment for multi-entity slots."""
+    normalised = " ".join(value.strip().lower().split())
+    if not normalised:
+        return "unknown"
+    return normalised[:120]
+
+
+def _is_multi_entity_key(key: str, slot: str) -> bool:
+    def _matches(value: str) -> bool:
+        return value in _MULTI_ENTITY_KEYS or any(
+            value == prefix or value.startswith(f"{prefix}.") for prefix in _MULTI_ENTITY_PREFIXES
+        )
+
+    return _matches(key) or _matches(slot)
+
+
+def _canonicalise_memory_slot(key: str, value: str) -> str:
+    """
+    Canonical supersession slot for a concrete memory row.
+
+    Singular facts such as `location.city` intentionally collapse to one
+    current slot. Multi-entity facts such as `pet.name` include the value
+    so "cat named Mochi" and "dog named Biscuit" remain simultaneously
+    active instead of overwriting each other.
+    """
+    slot = _canonicalise_slot(key)
+    if _is_multi_entity_key(key, slot):
+        return f"{slot}:{_normalise_slot_value(value)}"
+    return slot
 
 
 def _to_jsonb(d: dict) -> str:
@@ -259,10 +315,7 @@ async def _generate_chat_reply(
 ) -> str:
     settings = get_settings()
     client = get_client()
-    transcript = [
-        {"role": item.role, "content": item.content}
-        for item in history[-12:]
-    ]
+    transcript = [{"role": item.role, "content": item.content} for item in history[-12:]]
     try:
         resp = await client.chat.completions.create(
             model=settings.chat_model,
@@ -312,12 +365,15 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
     if embed_error is not None:
         # Legacy /ingest is a write path; we cannot store half-state.
         # Surface a retryable upstream-failure to the caller.
-        raise HTTPException(status_code=503, detail={
-            "error": "upstream_unavailable",
-            "stage": "embed",
-            "reason": embed_error,
-            "retryable": True,
-        })
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "upstream_unavailable",
+                "stage": "embed",
+                "reason": embed_error,
+                "retryable": True,
+            },
+        )
     settings = get_settings()
 
     pool = get_pool()
@@ -331,7 +387,9 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
                     SET text = EXCLUDED.text,
                         metadata = EXCLUDED.metadata
                 """,
-                doc.id, doc.text, _to_jsonb(doc.metadata),
+                doc.id,
+                doc.text,
+                _to_jsonb(doc.metadata),
             )
             await conn.execute(
                 """
@@ -342,7 +400,9 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
                         model = EXCLUDED.model,
                         created_at = NOW()
                 """,
-                doc.id, vec, settings.embedding_model,
+                doc.id,
+                vec,
+                settings.embedding_model,
             )
 
     return IngestResponse(ingested=len(payload.documents))
@@ -375,7 +435,8 @@ async def query(payload: QueryRequest) -> QueryResponse:
             ORDER BY e.embedding <=> $1
             LIMIT   $2
             """,
-            qvec, payload.top_k,
+            qvec,
+            payload.top_k,
         )
 
     return QueryResponse(
@@ -642,12 +703,14 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 INSERT INTO turn_messages (turn_id, idx, role, name, content)
                 VALUES ($1, $2, $3, $4, $5)
                 """,
-                turn_id, idx, msg.role, msg.name, msg.content,
+                turn_id,
+                idx,
+                msg.role,
+                msg.name,
+                msg.content,
             )
         if embed_error is None:
-            for idx, (msg, vec) in enumerate(
-                zip(payload.messages, turn_vectors, strict=True)
-            ):
+            for idx, (msg, vec) in enumerate(zip(payload.messages, turn_vectors, strict=True)):
                 doc_id = f"turn:{turn_id}:{idx}"
                 provenance = {
                     "kind": "turn_message",
@@ -664,14 +727,18 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                     INSERT INTO documents (id, text, metadata)
                     VALUES ($1, $2, $3::jsonb)
                     """,
-                    doc_id, msg.content, _to_jsonb(provenance),
+                    doc_id,
+                    msg.content,
+                    _to_jsonb(provenance),
                 )
                 await conn.execute(
                     """
                     INSERT INTO embeddings (doc_id, embedding, model)
                     VALUES ($1, $2, $3)
                     """,
-                    doc_id, vec, settings.embedding_model,
+                    doc_id,
+                    vec,
+                    settings.embedding_model,
                 )
 
         for mem_idx, mem in enumerate(extracted):
@@ -684,18 +751,20 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             #   3. Same slot, new value    → insert new row with
             #      supersedes=old.id, flip old.active=FALSE.
             #      Old row stays for /users/{id}/memories history;
-            #      its kind='memory' document is deleted so /recall
-            #      doesn't re-surface stale facts via the hybrid
-            #      memory retriever (HGT-23).
+            #      its kind='memory' document is retained, but the
+            #      memory retriever joins back to `memories.active` so
+            #      inactive facts do not surface (HGT-23).
             #
             # HGT-26 lookup uses canonical slot, not the raw LLM key,
             # so opinion.typescript.generics and opinion.typescript
-            # collapse onto the same slot. HGT-27 takes a transaction-
-            # scoped advisory lock on (user_id, slot) before the
-            # read-modify-write so concurrent /turns to the same slot
-            # serialise — the partial unique index on
-            # (user_id, slot) WHERE active=TRUE is the DB backstop.
-            slot = _canonicalise_slot(mem["key"])
+            # collapse onto the same slot. Multi-entity rows include
+            # their value in the slot so two pets/children/vehicles can
+            # stay active together. HGT-27 takes a transaction-scoped
+            # advisory lock on (user_id, slot) before the read-modify-
+            # write so concurrent /turns to the same slot serialise —
+            # the partial unique index on (user_id, slot) WHERE active
+            # = TRUE is the DB backstop.
+            slot = _canonicalise_memory_slot(mem["key"], mem["value"])
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 f"{payload.user_id}:{slot}",
@@ -706,7 +775,8 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 FROM   memories
                 WHERE  user_id = $1 AND slot = $2 AND active = TRUE
                 """,
-                payload.user_id, slot,
+                payload.user_id,
+                slot,
             )
             if prior is not None and prior["value"] == mem["value"]:
                 await conn.execute(
@@ -725,13 +795,10 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                     """,
                     prior["id"],
                 )
-                # Drop the superseded fact's `kind='memory'` document so
-                # the query-relevant retrieval (HGT-23) never re-surfaces
-                # it. The new active row gets its own mem:{id} doc below.
-                await conn.execute(
-                    "DELETE FROM documents WHERE id = $1",
-                    f"mem:{prior['id']}",
-                )
+                # Keep the superseded fact's `kind='memory'` document.
+                # Retrieval joins back to memories.active, so stale facts
+                # do not surface, and session-delete can later reactivate
+                # the prior row without losing its retrieval document.
             await conn.execute(
                 """
                 INSERT INTO memories (
@@ -771,14 +838,18 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                     INSERT INTO documents (id, text, metadata)
                     VALUES ($1, $2, $3::jsonb)
                     """,
-                    mem_doc_id, memory_texts[mem_idx], _to_jsonb(mem_provenance),
+                    mem_doc_id,
+                    memory_texts[mem_idx],
+                    _to_jsonb(mem_provenance),
                 )
                 await conn.execute(
                     """
                     INSERT INTO embeddings (doc_id, embedding, model)
                     VALUES ($1, $2, $3)
                     """,
-                    mem_doc_id, memory_vectors[mem_idx], settings.embedding_model,
+                    mem_doc_id,
+                    memory_vectors[mem_idx],
+                    settings.embedding_model,
                 )
     return TurnResponse(id=turn_id)
 
@@ -791,12 +862,12 @@ async def _recall_candidates(
     top_k: int,
 ) -> list[dict]:
     """
-    Hybrid retrieval: cosine top-N (HNSW) AND BM25 top-N (Postgres
+    Hybrid retrieval: cosine top-N (HNSW) AND FTS top-N (Postgres
     `tsvector` + `ts_rank_cd`) in parallel, fused via Reciprocal Rank
     Fusion. §10 explicitly calls vanilla cosine-top-k a floor — pure
     embedding similarity under-scores keyword-anchored queries on
-    short turns, BM25 catches the literal-token signal, RRF blends the
-    two rankings without needing them to share a score scale.
+    short turns, Postgres FTS catches the literal-token signal, RRF
+    blends the two rankings without needing them to share a score scale.
 
     Citations keep `score = cosine_similarity` (interpretable in
     [0,1]) so the §3 contract semantics don't shift. Ordering is by
@@ -856,11 +927,14 @@ async def _recall_candidates(
             "rrf": 1.0 / (_RRF_K + rank),
         }
     for rank, row in enumerate(bm_rows, start=1):
-        entry = fused.setdefault(row["id"], {
-            "row": row,
-            "cosine_score": float(row["cosine_score"]),
-            "rrf": 0.0,
-        })
+        entry = fused.setdefault(
+            row["id"],
+            {
+                "row": row,
+                "cosine_score": float(row["cosine_score"]),
+                "rrf": 0.0,
+            },
+        )
         entry["rrf"] += 1.0 / (_RRF_K + rank)
 
     ordered = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)
@@ -931,20 +1005,24 @@ async def _recall_memory_candidates(
     """
     pool = get_pool()
     cosine_sql = """
-        SELECT  d.metadata->>'memory_id' AS memory_id,
+        SELECT  m.id AS memory_id,
                 1 - (e.embedding <=> $1) AS cosine_score
         FROM    embeddings e
         JOIN    documents  d ON d.id = e.doc_id
+        JOIN    memories   m ON m.id = d.metadata->>'memory_id'
         WHERE   d.metadata->>'kind' = 'memory'
           AND   d.metadata->>'user_id' = $2
+          AND   m.active = TRUE
         ORDER BY e.embedding <=> $1
         LIMIT   $3
     """
     bm25_sql = """
-        SELECT  d.metadata->>'memory_id' AS memory_id
+        SELECT  m.id AS memory_id
         FROM    documents d
+        JOIN    memories m ON m.id = d.metadata->>'memory_id'
         WHERE   d.metadata->>'kind' = 'memory'
           AND   d.metadata->>'user_id' = $1
+          AND   m.active = TRUE
           AND   d.tsv @@ plainto_tsquery('english', $2)
         ORDER BY ts_rank_cd(d.tsv, plainto_tsquery('english', $2)) DESC
         LIMIT   $3
@@ -957,7 +1035,7 @@ async def _recall_memory_candidates(
         mid = row["memory_id"]
         if not mid:
             continue
-        entry = fused.setdefault(mid, {"rrf": 0.0, "cosine": 0.0})
+        entry = fused.setdefault(mid, {"rrf": 0.0, "cosine": 0.0, "fts": False})
         entry["rrf"] += 1.0 / (_RRF_K + rank)
         # cosine_score from the SQL is the actual similarity (1 - distance);
         # cosine retrieval is the only place we have it, so set directly.
@@ -966,9 +1044,109 @@ async def _recall_memory_candidates(
         mid = row["memory_id"]
         if not mid:
             continue
-        entry = fused.setdefault(mid, {"rrf": 0.0, "cosine": 0.0})
+        entry = fused.setdefault(mid, {"rrf": 0.0, "cosine": 0.0, "fts": False})
         entry["rrf"] += 1.0 / (_RRF_K + rank)
+        entry["fts"] = True
     return fused
+
+
+async def _ensure_memory_document(conn, row) -> None:
+    """
+    Ensure an active memory has a `documents` row.
+
+    Older revisions deleted documents when a memory was superseded. If a
+    session delete later reactivates that prior memory, we recreate the
+    text document so FTS can still find it; embeddings can be backfilled
+    by `/admin/reembed_memories`.
+    """
+    mem_doc_id = f"mem:{row['id']}"
+    mem_provenance = {
+        "kind": "memory",
+        "memory_id": row["id"],
+        "user_id": row["user_id"],
+        "key": row["key"],
+        "type": row["type"],
+        "session_id": row["source_session"],
+        "turn_id": row["source_turn"],
+        "ts": row["created_at"].isoformat(),
+    }
+    await conn.execute(
+        """
+        INSERT INTO documents (id, text, metadata)
+        VALUES ($1, $2, $3::jsonb)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        mem_doc_id,
+        f"{row['key']}: {row['value']}",
+        _to_jsonb(mem_provenance),
+    )
+
+
+async def _repair_memory_slots_after_delete(conn, deleted_rows: list) -> None:
+    """
+    Repair supersession chains after deleting memories by provenance.
+
+    Policy: deleting the active row reactivates the newest remaining row
+    in the same `(user_id, slot)`. Deleting an inactive row relinks any
+    rows that pointed at it to that deleted row's predecessor.
+    """
+    if not deleted_rows:
+        return
+
+    deleted_by_id = {r["id"]: r for r in deleted_rows}
+    affected_slots = {
+        (
+            r["user_id"],
+            r["slot"] or _canonicalise_memory_slot(r["key"], r["value"]),
+        )
+        for r in deleted_rows
+    }
+
+    for user_id, slot in sorted(affected_slots):
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            f"{user_id}:{slot}",
+        )
+        remaining = await conn.fetch(
+            """
+            SELECT  id, user_id, type, key, value, source_session, source_turn,
+                    created_at, updated_at, supersedes, active, slot
+            FROM    memories
+            WHERE   user_id = $1 AND slot = $2
+            ORDER BY updated_at DESC, id ASC
+            """,
+            user_id,
+            slot,
+        )
+        if not remaining:
+            continue
+
+        for row in remaining:
+            supersedes = row["supersedes"]
+            seen: set[str] = set()
+            while supersedes in deleted_by_id and supersedes not in seen:
+                seen.add(supersedes)
+                supersedes = deleted_by_id[supersedes]["supersedes"]
+            if supersedes != row["supersedes"]:
+                await conn.execute(
+                    "UPDATE memories SET supersedes = $1 WHERE id = $2",
+                    supersedes,
+                    row["id"],
+                )
+
+        if any(r["active"] for r in remaining):
+            continue
+
+        promote = remaining[0]
+        await conn.execute(
+            """
+            UPDATE memories
+            SET    active = TRUE, updated_at = NOW()
+            WHERE  id = $1
+            """,
+            promote["id"],
+        )
+        await _ensure_memory_document(conn, promote)
 
 
 def _facts_block_relevant(
@@ -1050,7 +1228,9 @@ def _format_recall_context(
     used = 0
 
     facts_eligible = bool(memories) and _facts_block_relevant(
-        query, memory_scores, hits,
+        query,
+        memory_scores,
+        hits,
     )
 
     if facts_eligible:
@@ -1071,9 +1251,8 @@ def _format_recall_context(
         # We use cosine, not RRF rank, because rank-1 from one retriever
         # always yields ≈0.0164 regardless of how relevant the doc is —
         # cosine is the actual relevance signal.
-        per_fact_gate_active = (
-            memory_scores is not None
-            and not _RECALL_PROFILE_QUERY_RE.search(query)
+        per_fact_gate_active = memory_scores is not None and not _RECALL_PROFILE_QUERY_RE.search(
+            query
         )
 
         # Sort key: (-rrf_score, type_priority, -updated_at_ts).
@@ -1093,7 +1272,16 @@ def _format_recall_context(
         for mem in sorted(memories, key=_rank_key):
             entry = scores.get(mem["id"]) or {}
             cosine_sim = entry.get("cosine", 0.0) if isinstance(entry, dict) else 0.0
-            if per_fact_gate_active and cosine_sim < _RECALL_FACT_INCLUSION_MIN_COSINE:
+            fts_match = (
+                isinstance(entry, dict)
+                and bool(entry.get("fts"))
+                and entry.get("rrf", 0.0) >= _RECALL_FACTS_GATE_MEMORY_RRF
+            )
+            if (
+                per_fact_gate_active
+                and cosine_sim < _RECALL_FACT_INCLUSION_MIN_COSINE
+                and not fts_match
+            ):
                 continue
             line = f"- {mem['key']}: {mem['value']}"
             cost = _approx_tokens(line) + 1
@@ -1111,10 +1299,7 @@ def _format_recall_context(
     # HGT-25: filter conversation hits below the relevance floor so
     # off-topic queries return empty context, not stale chunks. Same
     # threshold as the facts gate keeps the two layers consistent.
-    relevant_hits = [
-        h for h in hits
-        if h.get("score", 0.0) >= _RECALL_CONVERSATION_MIN_SCORE
-    ]
+    relevant_hits = [h for h in hits if h.get("score", 0.0) >= _RECALL_CONVERSATION_MIN_SCORE]
     chosen: list[dict] = []
     if relevant_hits:
         hits_header = "## Relevant from recent conversations"
@@ -1135,11 +1320,13 @@ def _format_recall_context(
                 break
             used += head + cost
             hit_lines.append(line)
-            chosen.append({
-                "turn_id": meta.get("turn_id") or "",
-                "score": hit["score"],
-                "snippet": snippet,
-            })
+            chosen.append(
+                {
+                    "turn_id": meta.get("turn_id") or "",
+                    "score": hit["score"],
+                    "snippet": snippet,
+                }
+            )
         if hit_lines:
             sections.append("\n".join([hits_header, *hit_lines]))
 
@@ -1194,15 +1381,24 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     memory_scores: dict[str, dict] | None = None
     if embed_error is not None:
         log.warning(
-            "recall.embed_failed", user_id=payload.user_id, reason=embed_error,
+            "recall.embed_failed",
+            user_id=payload.user_id,
+            reason=embed_error,
         )
         hits: list[dict] = []
     else:
         memory_scores = await _recall_memory_candidates(
-            payload.query, qvec, payload.user_id, _MEMORY_RECALL_TOPK,
+            payload.query,
+            qvec,
+            payload.user_id,
+            _MEMORY_RECALL_TOPK,
         )
         hits = await _recall_candidates(
-            payload.query, qvec, payload.user_id, payload.session_id, _RECALL_TOPK,
+            payload.query,
+            qvec,
+            payload.user_id,
+            payload.session_id,
+            _RECALL_TOPK,
         )
 
     context, citations = _format_recall_context(
@@ -1266,18 +1462,22 @@ async def search(payload: SearchRequest) -> SearchResponse:
         meta = _from_jsonb(r["metadata"])
         ts_str = meta.get("ts")
         ts = datetime.fromisoformat(ts_str) if ts_str else datetime.fromtimestamp(0)
-        results.append(SearchHit(
-            content=r["text"],
-            score=float(r["score"]),
-            session_id=meta.get("session_id") or "",
-            timestamp=ts,
-            metadata={k: v for k, v in meta.items() if k not in {"kind"}},
-        ))
+        results.append(
+            SearchHit(
+                content=r["text"],
+                score=float(r["score"]),
+                session_id=meta.get("session_id") or "",
+                timestamp=ts,
+                metadata={k: v for k, v in meta.items() if k not in {"kind"}},
+            )
+        )
     return SearchResponse(results=results)
 
 
 @router.get("/users/{user_id}/memories", response_model=UserMemoriesResponse)
-async def list_user_memories(user_id: str) -> UserMemoriesResponse:
+async def list_user_memories(
+    user_id: str = ApiPath(min_length=1, max_length=200),
+) -> UserMemoriesResponse:
     """
     Return typed structured memories for the user (§3 inspection
     endpoint). §4.1 requires the supersession chain to be preserved
@@ -1319,7 +1519,9 @@ async def list_user_memories(user_id: str) -> UserMemoriesResponse:
 
 
 @router.delete("/sessions/{session_id}", status_code=204)
-async def delete_section3_session(session_id: str) -> Response:
+async def delete_section3_session(
+    session_id: str = ApiPath(min_length=1, max_length=200),
+) -> Response:
     """
     Drop every turn for the §3 string session_id, plus the indexed
     documents/embeddings rows and any structured memories whose
@@ -1329,24 +1531,42 @@ async def delete_section3_session(session_id: str) -> Response:
     """
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
-        await conn.execute(
+        memories_to_delete = await conn.fetch(
             """
-            DELETE FROM documents
-            WHERE metadata->>'kind' IN ('turn_message', 'memory')
-              AND metadata->>'session_id' = $1
+            SELECT  id, user_id, type, key, value, source_session, source_turn,
+                    created_at, supersedes, active, slot
+            FROM    memories
+            WHERE   source_session = $1
             """,
             session_id,
         )
         await conn.execute(
+            """
+            DELETE FROM documents
+            WHERE metadata->>'kind' = 'turn_message'
+              AND metadata->>'session_id' = $1
+            """,
+            session_id,
+        )
+        if memories_to_delete:
+            memory_doc_ids = [f"mem:{r['id']}" for r in memories_to_delete]
+            await conn.execute(
+                "DELETE FROM documents WHERE id = ANY($1::text[])",
+                memory_doc_ids,
+            )
+        await conn.execute(
             "DELETE FROM memories WHERE source_session = $1",
             session_id,
         )
+        await _repair_memory_slots_after_delete(conn, memories_to_delete)
         await conn.execute("DELETE FROM turns WHERE session_id = $1", session_id)
     return Response(status_code=204)
 
 
 @router.delete("/users/{user_id}", status_code=204)
-async def delete_section3_user(user_id: str) -> Response:
+async def delete_section3_user(
+    user_id: str = ApiPath(min_length=1, max_length=200),
+) -> Response:
     """Drop every turn, indexed message, and structured memory for this user."""
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
@@ -1451,7 +1671,8 @@ async def admin_turn_index(
             ORDER BY d.created_at DESC, d.id ASC
             LIMIT   ${len(args) + 1}
             """,
-            *args, limit,
+            *args,
+            limit,
         )
 
     return TurnIndexResponse(
@@ -1536,16 +1757,10 @@ async def _count_inactive_rows(
         return 0
     pool = get_pool()
     if key is not None:
-        sql = (
-            "SELECT count(*) FROM memories "
-            "WHERE user_id = $1 AND active = FALSE AND key = $2"
-        )
+        sql = "SELECT count(*) FROM memories WHERE user_id = $1 AND active = FALSE AND key = $2"
         args = (user_id, key)
     else:
-        sql = (
-            "SELECT count(*) FROM memories "
-            "WHERE user_id = $1 AND active = FALSE AND key LIKE $2"
-        )
+        sql = "SELECT count(*) FROM memories WHERE user_id = $1 AND active = FALSE AND key LIKE $2"
         args = (user_id, f"{key_prefix}%")
     async with pool.acquire() as conn:
         return int(await conn.fetchval(sql, *args) or 0)
@@ -1568,8 +1783,10 @@ async def admin_reembed_memories(
     the new `/turns` code path writes the sibling docs synchronously.
     """
     pool = get_pool()
-    where = ["m.active = TRUE",
-             "NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = 'mem:' || m.id)"]
+    where = [
+        "m.active = TRUE",
+        "NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = 'mem:' || m.id)",
+    ]
     args: list[object] = []
     if user_id is not None:
         args.append(user_id)
@@ -1620,7 +1837,9 @@ async def admin_reembed_memories(
                 VALUES ($1, $2, $3::jsonb)
                 ON CONFLICT (id) DO NOTHING
                 """,
-                mem_doc_id, f"{row['key']}: {row['value']}", _to_jsonb(mem_provenance),
+                mem_doc_id,
+                f"{row['key']}: {row['value']}",
+                _to_jsonb(mem_provenance),
             )
             await conn.execute(
                 """
@@ -1628,7 +1847,9 @@ async def admin_reembed_memories(
                 VALUES ($1, $2, $3)
                 ON CONFLICT (doc_id) DO NOTHING
                 """,
-                mem_doc_id, vec, settings.embedding_model,
+                mem_doc_id,
+                vec,
+                settings.embedding_model,
             )
             processed += 1
     return {"processed": processed, "skipped": 0, "failed": 0, "error": None}
@@ -1641,7 +1862,7 @@ async def admin_recanonicalise_memories(
 ) -> dict:
     """
     HGT-26 backfill: walk memories whose `slot` is NULL or stale,
-    apply `_canonicalise_slot(key)`, and resolve any active-row
+    apply `_canonicalise_memory_slot(key, value)`, and resolve any active-row
     collisions that emerge by superseding older losers to the newest
     winner per `(user_id, slot)`. Idempotent — second run on a clean
     state returns `processed=0`.
@@ -1652,23 +1873,20 @@ async def admin_recanonicalise_memories(
     /turns writes always include `slot`.
     """
     pool = get_pool()
-    where = ["(slot IS NULL OR slot <> $1)"]  # placeholder; we replace below
-    # Build dynamic WHERE: rows missing slot OR with stale slot for the
-    # current canonicalisation. Stale-detection is computed in Python
-    # against `key`, so the SQL just pulls all rows scoped by user_id
-    # and we filter in memory.
+    # Stale-detection is computed in Python against `key` and `value`,
+    # so SQL pulls the scoped rows first. We then slice the stale subset
+    # by `limit`; this makes `processed=0` a reliable completion signal
+    # even when early rows are already canonical.
     args: list[object] = []
     sql_where = ["TRUE"]
     if user_id is not None:
         args.append(user_id)
         sql_where.append(f"user_id = ${len(args)}")
-    args.append(limit)
     sql = f"""
         SELECT id, user_id, key, value, active, updated_at, slot
         FROM   memories
-        WHERE  {' AND '.join(sql_where)}
+        WHERE  {" AND ".join(sql_where)}
         ORDER BY user_id, updated_at DESC, id ASC
-        LIMIT  ${len(args)}
     """
 
     async with pool.acquire() as conn, conn.transaction():
@@ -1676,10 +1894,15 @@ async def admin_recanonicalise_memories(
         # Group by (user_id, computed canonical slot). Skip rows whose
         # current `slot` already matches — idempotency guard.
         groups: dict[tuple[str, str], list] = {}
+        stale_rows = []
         for r in rows:
-            canonical = _canonicalise_slot(r["key"])
+            canonical = _canonicalise_memory_slot(r["key"], r["value"])
             if r["slot"] == canonical:
                 continue
+            stale_rows.append((r, canonical))
+        remaining_stale = max(0, len(stale_rows) - limit)
+
+        for r, canonical in stale_rows[:limit]:
             groups.setdefault((r["user_id"], canonical), []).append(r)
 
         processed = 0
@@ -1696,11 +1919,13 @@ async def admin_recanonicalise_memories(
                 SELECT id, updated_at FROM memories
                 WHERE user_id = $1 AND slot = $2 AND active = TRUE
                 """,
-                uid, slot,
+                uid,
+                slot,
             )
             actives = sorted(
                 [r for r in rs if r["active"]],
-                key=lambda r: r["updated_at"], reverse=True,
+                key=lambda r: r["updated_at"],
+                reverse=True,
             )
             if existing_active is not None:
                 # Pre-existing winner — losers among `actives` get
@@ -1724,7 +1949,9 @@ async def admin_recanonicalise_memories(
                            updated_at = NOW()
                     WHERE  id = $3
                     """,
-                    winner_id, slot, loser["id"],
+                    winner_id,
+                    slot,
+                    loser["id"],
                 )
                 await conn.execute(
                     "DELETE FROM documents WHERE id = $1",
@@ -1735,17 +1962,20 @@ async def admin_recanonicalise_memories(
 
             # Stamp slot on every row in the group that doesn't already
             # have it (active winner + any inactive history rows).
+            loser_ids = {loser["id"] for loser in losers}
             for r in rs:
-                if r["id"] in {l["id"] for l in losers}:
+                if r["id"] in loser_ids:
                     continue
                 await conn.execute(
                     "UPDATE memories SET slot = $1 WHERE id = $2 AND (slot IS DISTINCT FROM $1)",
-                    slot, r["id"],
+                    slot,
+                    r["id"],
                 )
                 processed += 1
     return {
         "processed": processed,
         "collisions_resolved": collisions_resolved,
+        "remaining_stale": remaining_stale,
     }
 
 
@@ -1772,7 +2002,12 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
     metrics. Destructive: resets every user_id in the fixture, but only if
     that user_id is prefixed `fix-` (guard against zapping real data).
     """
-    fixture_path = _FIXTURE_DIR / f"{payload.name}.json"
+    fixture_root = _FIXTURE_DIR.resolve()
+    fixture_path = (_FIXTURE_DIR / f"{payload.name}.json").resolve()
+    try:
+        fixture_path.relative_to(fixture_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid_fixture_name") from exc
     if not fixture_path.exists():
         raise HTTPException(status_code=404, detail=f"fixture_not_found:{payload.name}")
 
@@ -1931,25 +2166,25 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
                 noise_passed += 1
             note_parts = [f"noise threshold < {threshold}"]
             if expected_empty:
-                note_parts.append(
-                    "context==\"\"" if empty_ok else "EXPECTED empty context"
+                note_parts.append('context==""' if empty_ok else "EXPECTED empty context")
+            probes_out.append(
+                FixtureProbeResult(
+                    label=probe["label"],
+                    query=probe["query"],
+                    is_noise=True,
+                    top_hit_turn_label=top_label,
+                    top_score=top_score,
+                    citations_count=len(cites),
+                    passed=ok,
+                    notes="; ".join(note_parts),
+                    expected_top_score_under=per_probe_top_threshold,
+                    expected_known_facts_total=len(expected_facts),
+                    expected_known_facts_present=facts_present,
+                    forbidden_known_facts_violated=forbidden_violated,
+                    supersession_chain_length=chain_length,
+                    supersession_expected_min=chain_min,
                 )
-            probes_out.append(FixtureProbeResult(
-                label=probe["label"],
-                query=probe["query"],
-                is_noise=True,
-                top_hit_turn_label=top_label,
-                top_score=top_score,
-                citations_count=len(cites),
-                passed=ok,
-                notes="; ".join(note_parts),
-                expected_top_score_under=per_probe_top_threshold,
-                expected_known_facts_total=len(expected_facts),
-                expected_known_facts_present=facts_present,
-                forbidden_known_facts_violated=forbidden_violated,
-                supersession_chain_length=chain_length,
-                supersession_expected_min=chain_min,
-            ))
+            )
             continue
 
         positive_total += 1
@@ -1986,10 +2221,8 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
             # When the probe carries v2 expectations, fold them into pass/fail.
             facts_ok = facts_present == len(expected_facts)
             forbidden_ok = forbidden_violated == 0
-            chain_ok = (
-                expected_supersession is None
-                or (chain_length is not None and chain_min is not None
-                    and chain_length >= chain_min)
+            chain_ok = expected_supersession is None or (
+                chain_length is not None and chain_min is not None and chain_length >= chain_min
             )
             base_pass = (passed_top1 and substring_match) if expected_label else True
             passed = base_pass and facts_ok and forbidden_ok and chain_ok
@@ -2002,30 +2235,32 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         if top_score is not None:
             positive_top_scores.append(top_score)
 
-        probes_out.append(FixtureProbeResult(
-            label=probe["label"],
-            query=probe["query"],
-            is_noise=False,
-            expected_turn_label=expected_label,
-            expected_substrings=expected_subs,
-            top_hit_turn_label=top_label,
-            top_score=top_score,
-            citations_count=len(cites),
-            passed_top1=passed_top1,
-            passed_top3=passed_top3,
-            substring_match=substring_match,
-            passed=passed,
-            notes=(
-                f"multi-hop facts {facts_present}/{len(expected_facts)}"
-                if is_multihop
-                else f"expected={expected_label} got={top_label}"
-            ),
-            expected_known_facts_total=len(expected_facts),
-            expected_known_facts_present=facts_present,
-            forbidden_known_facts_violated=forbidden_violated,
-            supersession_chain_length=chain_length,
-            supersession_expected_min=chain_min,
-        ))
+        probes_out.append(
+            FixtureProbeResult(
+                label=probe["label"],
+                query=probe["query"],
+                is_noise=False,
+                expected_turn_label=expected_label,
+                expected_substrings=expected_subs,
+                top_hit_turn_label=top_label,
+                top_score=top_score,
+                citations_count=len(cites),
+                passed_top1=passed_top1,
+                passed_top3=passed_top3,
+                substring_match=substring_match,
+                passed=passed,
+                notes=(
+                    f"multi-hop facts {facts_present}/{len(expected_facts)}"
+                    if is_multihop
+                    else f"expected={expected_label} got={top_label}"
+                ),
+                expected_known_facts_total=len(expected_facts),
+                expected_known_facts_present=facts_present,
+                forbidden_known_facts_violated=forbidden_violated,
+                supersession_chain_length=chain_length,
+                supersession_expected_min=chain_min,
+            )
+        )
 
     # Surface extraction failures from the just-ingested fixture turns so
     # one Run-fixture click answers two questions: did /recall find the
@@ -2060,7 +2295,8 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         recall_at_3=(positive_top3 / positive_total) if positive_total else 0.0,
         noise_resistance=(noise_passed / noise_total) if noise_total else 0.0,
         mean_top_score=(sum(positive_top_scores) / len(positive_top_scores))
-            if positive_top_scores else 0.0,
+        if positive_top_scores
+        else 0.0,
         extraction_failures=extraction_failures,
         extraction_error_modes=extraction_error_modes,
         ingest_failures=ingest_failures,
@@ -2082,5 +2318,3 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         probes=probes_out,
         elapsed_ms=elapsed_ms,
     )
-
-

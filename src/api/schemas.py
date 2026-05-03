@@ -7,17 +7,32 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+MAX_ID_CHARS = 200
+MAX_NAME_CHARS = 64
+MAX_QUERY_CHARS = 2000
+MAX_MESSAGE_CHARS = 8000
+MAX_DOCUMENT_CHARS = 20000
+MAX_DOCUMENTS = 100
+MAX_MESSAGES = 50
+MAX_METADATA_ENTRIES = 50
+MAX_FIXTURE_NAME_CHARS = 64
+
 
 # ---------- POST /ingest ----------
 
+
 class Document(BaseModel):
-    id: str = Field(min_length=1, description="Stable caller-supplied id")
-    text: str = Field(min_length=1)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    id: str = Field(
+        min_length=1,
+        max_length=MAX_ID_CHARS,
+        description="Stable caller-supplied id",
+    )
+    text: str = Field(min_length=1, max_length=MAX_DOCUMENT_CHARS)
+    metadata: dict[str, Any] = Field(default_factory=dict, max_length=MAX_METADATA_ENTRIES)
 
 
 class IngestRequest(BaseModel):
-    documents: list[Document] = Field(min_length=1)
+    documents: list[Document] = Field(min_length=1, max_length=MAX_DOCUMENTS)
 
 
 class IngestResponse(BaseModel):
@@ -26,15 +41,16 @@ class IngestResponse(BaseModel):
 
 # ---------- POST /query ----------
 
+
 class QueryRequest(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARS)
     top_k: int = Field(default=5, ge=1, le=100)
 
 
 class QueryHit(BaseModel):
     id: str
     text: str
-    score: float            # cosine similarity in [-1, 1]; with normalized vectors, ~[0, 1]
+    score: float  # cosine similarity in [-1, 1]; with normalized vectors, ~[0, 1]
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -103,16 +119,16 @@ Section3Role = Literal["user", "assistant", "tool"]
 
 class TurnMessage(BaseModel):
     role: Section3Role
-    name: str | None = None
-    content: str = Field(min_length=1)
+    name: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_CHARS)
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class TurnRequest(BaseModel):
-    session_id: str = Field(min_length=1)
-    user_id: str | None = None
-    messages: list[TurnMessage] = Field(min_length=1)
+    session_id: str = Field(min_length=1, max_length=MAX_ID_CHARS)
+    user_id: str | None = Field(default=None, min_length=1, max_length=MAX_ID_CHARS)
+    messages: list[TurnMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
     timestamp: datetime
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict, max_length=MAX_METADATA_ENTRIES)
 
 
 class TurnResponse(BaseModel):
@@ -121,10 +137,11 @@ class TurnResponse(BaseModel):
 
 # ---------- §3 contract: POST /recall ----------
 
+
 class RecallRequest(BaseModel):
-    query: str = Field(min_length=1)
-    session_id: str = Field(min_length=1)
-    user_id: str | None = None
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARS)
+    session_id: str = Field(min_length=1, max_length=MAX_ID_CHARS)
+    user_id: str | None = Field(default=None, min_length=1, max_length=MAX_ID_CHARS)
     max_tokens: int = Field(default=1024, ge=1, le=32768)
 
 
@@ -141,10 +158,11 @@ class RecallResponse(BaseModel):
 
 # ---------- §3 contract: POST /search ----------
 
+
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=1)
-    session_id: str | None = None
-    user_id: str | None = None
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARS)
+    session_id: str | None = Field(default=None, min_length=1, max_length=MAX_ID_CHARS)
+    user_id: str | None = Field(default=None, min_length=1, max_length=MAX_ID_CHARS)
     limit: int = Field(default=10, ge=1, le=100)
 
 
@@ -187,6 +205,7 @@ class UserMemoriesResponse(BaseModel):
 # Read-only inspector so the static UI can show the §3 turn index
 # without requiring psql access on the host machine.
 
+
 class TurnIndexRow(BaseModel):
     doc_id: str
     text: str
@@ -209,8 +228,14 @@ class TurnIndexResponse(BaseModel):
 # verdicts plus aggregate metrics. Recall-quality measurement harness
 # per CLAUDE.md §7 / §10.
 
+
 class RunFixtureRequest(BaseModel):
-    name: str = Field(default="v1", min_length=1)
+    name: str = Field(
+        default="v1",
+        min_length=1,
+        max_length=MAX_FIXTURE_NAME_CHARS,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
 
 
 class FixtureProbeResult(BaseModel):
@@ -273,5 +298,3 @@ class RunFixtureResponse(BaseModel):
     aggregate: FixtureAggregate
     probes: list[FixtureProbeResult]
     elapsed_ms: int
-
-

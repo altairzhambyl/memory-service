@@ -13,9 +13,11 @@ OpenAI — both are lazy.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from src.api.routes import (
+    _RECALL_FACTS_GATE_MEMORY_RRF,
+    _canonicalise_memory_slot,
     _canonicalise_slot,
     _facts_block_relevant,
     _format_recall_context,
@@ -31,7 +33,7 @@ def _mem(mid: str, mtype: str, key: str, value: str, *, ts: float = 1700000000.0
         "type": mtype,
         "key": key,
         "value": value,
-        "updated_at": datetime.fromtimestamp(ts, tz=timezone.utc),
+        "updated_at": datetime.fromtimestamp(ts, tz=UTC),
     }
 
 
@@ -71,6 +73,18 @@ def test_canon_slot_falls_back_to_key_for_unknown():
     assert _canonicalise_slot("custom.weird") == "custom.weird"
 
 
+def test_memory_slot_keeps_multiple_pet_names_separate():
+    """Two `pet.name` rows are separate entity facts, not corrections."""
+    assert _canonicalise_memory_slot("pet.name", "Mochi") == "pet.name:mochi"
+    assert _canonicalise_memory_slot("pet.name", "Biscuit") == "pet.name:biscuit"
+    assert _canonicalise_memory_slot("pet", "Mochi") == "pet:mochi"
+    assert _canonicalise_memory_slot("pet.species", "cat") == "pet.species:cat"
+
+
+def test_memory_slot_still_collapses_singular_location():
+    assert _canonicalise_memory_slot("location.city", "Austin") == "location.current_city"
+
+
 # ---------------------------------------------------------------------------
 # _parse_known_facts_block — used by the fixture runner verdicts.
 # ---------------------------------------------------------------------------
@@ -106,9 +120,14 @@ def test_parse_known_facts_handles_empty_context():
 
 
 def test_gate_renders_when_memory_score_clears_threshold():
-    assert _facts_block_relevant(
-        "any query", {"id-1": {"rrf": 0.05, "cosine": 0.4}}, [],
-    ) is True
+    assert (
+        _facts_block_relevant(
+            "any query",
+            {"id-1": {"rrf": 0.05, "cosine": 0.4}},
+            [],
+        )
+        is True
+    )
 
 
 def test_gate_renders_when_conversation_score_clears_threshold():
@@ -120,11 +139,14 @@ def test_gate_blocks_when_all_signals_below_threshold():
     """v2 noise-typed-user-empty-context probe pattern: known user,
     unrelated query — both retrievers return weak scores → no facts.
     """
-    assert _facts_block_relevant(
-        "What is the user's opinion on quantum computing?",
-        {"id-1": {"rrf": 0.005, "cosine": 0.05}},
-        [{"score": 0.15}],
-    ) is False
+    assert (
+        _facts_block_relevant(
+            "What is the user's opinion on quantum computing?",
+            {"id-1": {"rrf": 0.005, "cosine": 0.05}},
+            [{"score": 0.15}],
+        )
+        is False
+    )
 
 
 def test_gate_renders_for_profile_query_regardless_of_scores():
@@ -160,7 +182,8 @@ def test_format_drops_facts_section_when_budget_too_small_for_header_plus_line()
     of returning a header-only context that exceeds the budget."""
     mems = [_mem("a", "fact", "k", "v")]
     ctx, _ = _format_recall_context(
-        mems, [],
+        mems,
+        [],
         max_tokens=1,
         memory_scores={"a": {"rrf": 0.05, "cosine": 0.5}},
         query="x",
@@ -171,7 +194,8 @@ def test_format_drops_facts_section_when_budget_too_small_for_header_plus_line()
 def test_format_renders_facts_when_budget_admits_header_plus_one_line():
     mems = [_mem("a", "fact", "diet.style", "vegetarian")]
     ctx, _ = _format_recall_context(
-        mems, [],
+        mems,
+        [],
         max_tokens=64,
         memory_scores={"a": {"rrf": 0.05, "cosine": 0.5}},
         query="diet",
@@ -198,7 +222,11 @@ def test_format_query_aware_sort_promotes_relevant_facts_under_tight_budget():
         "pet": {"rrf": 0.025, "cosine": 0.50},
     }
     ctx, _ = _format_recall_context(
-        mems, [], max_tokens=64, memory_scores=scores, query="what does the user eat",
+        mems,
+        [],
+        max_tokens=64,
+        memory_scores=scores,
+        query="what does the user eat",
     )
     # diet should appear; employment trails; pet may or may not fit.
     assert "diet.style" in ctx
@@ -220,7 +248,11 @@ def test_format_filters_low_score_conversation_hits():
         }
     ]
     ctx, citations = _format_recall_context(
-        [], hits, max_tokens=1024, memory_scores={}, query="off-topic question",
+        [],
+        hits,
+        max_tokens=1024,
+        memory_scores={},
+        query="off-topic question",
     )
     assert ctx == ""
     assert citations == []
@@ -235,7 +267,11 @@ def test_format_keeps_conversation_hits_above_threshold():
         }
     ]
     ctx, citations = _format_recall_context(
-        [], hits, max_tokens=1024, memory_scores={}, query="relevant question",
+        [],
+        hits,
+        max_tokens=1024,
+        memory_scores={},
+        query="relevant question",
     )
     assert "## Relevant from recent conversations" in ctx
     assert "relevant chunk" in ctx
@@ -249,7 +285,11 @@ def test_format_renders_facts_in_degraded_mode_even_when_off_topic_query():
     user's stable identity on a transient embed blip."""
     mems = [_mem("a", "fact", "location.city", "Berlin")]
     ctx, _ = _format_recall_context(
-        mems, [], max_tokens=1024, memory_scores=None, query="something off-topic",
+        mems,
+        [],
+        max_tokens=1024,
+        memory_scores=None,
+        query="something off-topic",
     )
     assert "Berlin" in ctx
 
@@ -277,7 +317,8 @@ def test_format_per_fact_gate_drops_low_cosine_memories():
         "loc": {"rrf": 0.05, "cosine": 0.55},
     }
     ctx, _ = _format_recall_context(
-        mems, [],
+        mems,
+        [],
         max_tokens=1024,
         memory_scores=scores,
         query="What is the user's opinion on quantum computing?",
@@ -302,7 +343,8 @@ def test_format_per_fact_gate_bypassed_for_profile_query():
         "loc": {"rrf": 0.0164, "cosine": 0.10},
     }
     ctx, _ = _format_recall_context(
-        mems, [],
+        mems,
+        [],
         max_tokens=1024,
         memory_scores=scores,
         query="Tell me about this user.",
@@ -320,10 +362,33 @@ def test_format_per_fact_gate_bypassed_in_degraded_mode():
         _mem("loc", "fact", "location.city", "Berlin"),
     ]
     ctx, _ = _format_recall_context(
-        mems, [],
+        mems,
+        [],
         max_tokens=1024,
         memory_scores=None,
         query="any query while degraded",
     )
     assert "opinion.typescript" in ctx
     assert "location.city" in ctx
+
+
+def test_format_per_fact_gate_allows_fts_only_memory_hits():
+    """Exact keyword memory matches should not be dropped just because
+    the hit came from FTS and therefore has no cosine score.
+    """
+    mems = [_mem("pet", "fact", "pet.name", "Biscuit")]
+    ctx, _ = _format_recall_context(
+        mems,
+        [],
+        max_tokens=1024,
+        memory_scores={
+            "pet": {
+                "rrf": _RECALL_FACTS_GATE_MEMORY_RRF,
+                "cosine": 0.0,
+                "fts": True,
+            }
+        },
+        query="Does the user have a pet named Biscuit?",
+    )
+    assert "pet.name" in ctx
+    assert "Biscuit" in ctx
