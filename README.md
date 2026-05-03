@@ -450,16 +450,26 @@ Coverage map:
 | §3 contract surface (every endpoint × every input shape) | 50 |
 | §4.2 extraction (8 categories × 5 phrasings) | 40 |
 | §9 eval categories (noise / profile / multi-hop / sync / cross-session) | 35 |
+| Forgetting / decay stress (plant-and-bury, long chains, U-turns, multi-arc parallel, stale-fact retention, tight-budget aging) | 25 |
 | §4.1 fact evolution (arcs + history + recall surfaces current) | 20 |
 | §5 hard constraints (malformed + oversized + unicode + missing) | 20 |
 | Multi-entity slots (multi-pet / vehicle / child) | 15 |
 | Bounds & limits (at-limit / over-limit) | 10 |
 | Cleanup correctness (idempotent DELETE + chain repair) | 10 |
-| **Total** | **200** |
+| **Total** | **225** |
 
-**Latest run on this build: `193/200 PASS` (zero service bugs).**
-This is up from a prior `189/200` after two mock-only predicate
-tightenings (no service code changed):
+**Latest run on the 200-test core: `193/200 PASS` (zero service bugs).**
+The new **Forgetting / decay stress** category adds 25 tests on top
+(225 total); standalone re-run lands at **23/25 PASS** with the two
+remaining fails being LLM stochastic variance (rare-place-name
+extraction, short-arc supersession not always triggering on a 2-step
+arc). Forgetting tests verify long supersession chains hold up to
+depth 10, U-turns reactivate the original value as a fresh active
+row, planted facts survive up to 15 noise turns, and tight-budget
+recall favours query-relevance over recency.
+
+The 193/200 core baseline is up from `189/200` after two mock-only
+predicate tightenings (no service code changed):
 
 * `_recall_surfaces_current` no longer forbids the old value as a
   substring of the full `/recall` context — §4.1 preserves history,

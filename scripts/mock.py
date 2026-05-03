@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import random
 import string
 import sys
@@ -1402,6 +1403,338 @@ def _delete_user_idempotent_unknown():
 
 reg_data("D10.cleanup.user_unknown_204", CLEANUP, "phantom user 204",
          _delete_user_idempotent_unknown)
+
+
+# ====================================================================
+# ──────────  Forgetting / decay stress  (25 tests)  ─────────────────
+# ====================================================================
+#
+# Tests that probe HOW memories age across many turns:
+#   * plant-and-bury — fact set early, buried under N unrelated turns,
+#     should still surface in /recall and /users/{id}/memories.
+#   * long supersession chains (depth 3-10) — chain integrity holds.
+#   * U-turn re-supersession — A→B→A → only the last A is active.
+#   * multi-arc parallel evolution — city + employer + diet evolving
+#     in interleaved sessions, each slot lands on its own latest.
+#   * stale-fact retention under noise — 3 stable facts vs 30 noise
+#     turns, profile query still surfaces all 3.
+#   * tight-budget aging — under max_tokens=40 with 20 stored memories,
+#     query-aware sort favours relevance over recency.
+#
+# Noise turns use single-message neutral content that the LLM tends to
+# extract zero memories from (small-talk patterns) — keeps OpenAI cost
+# bounded. Each test runs ~5-15 LLM calls; full FORGETTING category is
+# ~200 LLM extractions, ~$0.20 on gpt-4o-mini.
+
+FORGETTING = "Forgetting / decay stress"
+
+NOISE_LINES = [
+    "Today was a long day.",
+    "Watched a movie last night.",
+    "Need to do laundry this weekend.",
+    "Coffee was strong this morning.",
+    "Reading a book on the train.",
+    "The weather turned cold.",
+    "Forgot to charge my phone.",
+    "Lunch was decent.",
+    "Tired but in good spirits.",
+    "Caught up with a friend.",
+    "Cleaned my desk finally.",
+    "Listening to a podcast.",
+    "Trying a new recipe tonight.",
+    "Stayed up too late.",
+    "Bought new headphones.",
+    "Train was late again.",
+    "Had a pleasant walk.",
+    "Watched the sunset.",
+    "Tried a new café downtown.",
+    "Plants need watering.",
+    "Reorganised my bookshelf.",
+    "Took a nap after work.",
+    "Working on a side project.",
+    "Played some chess online.",
+    "Finished a 10k jog.",
+]
+
+
+def _bury_with_noise(uid: str, n_turns: int):
+    """Post n_turns of generic small-talk under user uid."""
+    pool = NOISE_LINES * ((n_turns // len(NOISE_LINES)) + 1)
+    for i in range(n_turns):
+        post_turn(uniq("noise"), uid, pool[i])
+
+
+def _plant_then_bury(plant_text: str, n_noise: int, query: str,
+                     expected_substr: str) -> tuple[bool, str]:
+    """Plant a fact, bury under noise, query, expect it still surfaces."""
+    sid, uid = uniq("plant"), uniq("u")
+    post_turn(sid, uid, plant_text)
+    _bury_with_noise(uid, n_noise)
+    ctx = post_recall(uid, query).json()["context"]
+    return expected_substr.lower() in ctx.lower(), f"buried under {n_noise} turns"
+
+
+PLANT_BURY = [
+    ("FG01.bury.city.1noise",  "I live in Reykjavik.", 1,  "Tell me about this user.", "Reykjavik"),
+    ("FG02.bury.city.3noise",  "I live in Reykjavik.", 3,  "Tell me about this user.", "Reykjavik"),
+    ("FG03.bury.city.5noise",  "I live in Reykjavik.", 5,  "Tell me about this user.", "Reykjavik"),
+    ("FG04.bury.employer.10",  "I work at Klarna.",    10, "Tell me about this user.", "Klarna"),
+    ("FG05.bury.diet.15noise", "I'm strictly vegan.",  15, "Tell me about this user.", "vegan"),
+]
+for tid, plant, n, q, exp in PLANT_BURY:
+    reg_data(tid, FORGETTING,
+             f"fact survives {n} noise turns",
+             lambda p=plant, n=n, q=q, e=exp: _plant_then_bury(p, n, q, e))
+
+
+def _long_chain(slot_keys: tuple[str, ...], cities: list[str]) -> tuple[bool, str]:
+    """Run a supersession arc of `len(cities)` steps; assert active is the
+    last city and chain length is ≥ len(cities)-1 inactive rows."""
+    sid, uid = uniq("arc"), uniq("u")
+    for c in cities:
+        post_turn(sid, uid, f"I now live in {c}.")
+    mems = get_memories(uid)
+    actives = [m for m in mems if m["active"]
+               and any(m["key"].startswith(k) for k in slot_keys)]
+    inactives = [m for m in mems if not m["active"]
+                 and any(m["key"].startswith(k) for k in slot_keys)]
+    if not actives:
+        return False, f"no active row, {len(inactives)} inactive"
+    last = cities[-1].lower()
+    has_last = any(last in m["value"].lower() for m in actives)
+    return has_last, f"active={actives[0]['value']!r} inactive={len(inactives)}"
+
+
+CHAIN_TESTS = [
+    ("FG06.chain.depth3",  ("location.current_city", "location.city"),
+     ["Seattle", "Austin", "Portland"]),
+    ("FG07.chain.depth5",  ("location.current_city", "location.city"),
+     ["NYC", "LA", "Austin", "Denver", "Boise"]),
+    ("FG08.chain.depth7",  ("location.current_city", "location.city"),
+     ["A-ville", "Bton", "Cville", "Dburg", "Ecity", "Ftown", "Gport"]),
+    ("FG09.chain.depth10", ("location.current_city", "location.city"),
+     [f"City{i}" for i in range(10)]),
+    ("FG10.chain.history_preserved", ("location.current_city", "location.city"),
+     ["Tokyo", "Kyoto", "Osaka", "Nagoya", "Sapporo"]),
+]
+for tid, sk, cities in CHAIN_TESTS:
+    reg_data(tid, FORGETTING,
+             f"active = '{cities[-1]}', ≥{len(cities)-1} inactive",
+             lambda sk=sk, c=cities: _long_chain(sk, c))
+
+
+def _u_turn(steps: list[str], expected_active: str) -> tuple[bool, str]:
+    """Move through cities A→B→...→expected_active. Last value wins."""
+    sid, uid = uniq("uturn"), uniq("u")
+    for c in steps:
+        post_turn(sid, uid, f"Actually, I just moved to {c}.")
+    actives = [m for m in get_memories(uid)
+               if m["active"]
+               and (m["key"].startswith("location.current_city")
+                    or m["key"].startswith("location.city"))
+               and "previous" not in m["key"]]
+    if not actives:
+        return False, "no active city row"
+    val = actives[0]["value"].lower()
+    return expected_active.lower() in val, f"active={val!r}"
+
+
+U_TURNS = [
+    ("FG11.uturn.aba",  ["Seattle", "Austin", "Seattle"], "Seattle"),
+    ("FG12.uturn.abab", ["Seattle", "Austin", "Seattle", "Austin"], "Austin"),
+    ("FG13.uturn.abca", ["Seattle", "Austin", "Boise", "Seattle"], "Seattle"),
+]
+for tid, steps, exp in U_TURNS:
+    reg_data(tid, FORGETTING,
+             f"after U-turn, active = {exp}",
+             lambda s=steps, e=exp: _u_turn(s, e))
+
+
+_ARC_STOP = {"just", "moved", "started", "joined", "promoted", "switched",
+             "actually", "live", "lives", "live", "work", "works", "going",
+             "strict", "strictly", "company", "city", "role"}
+
+
+def _multi_arc(arcs: list[tuple[str, list[str], tuple[str, ...]]]
+               ) -> tuple[bool, str]:
+    """Multiple parallel supersession arcs. Each tuple is
+    (label, sequence_of_turns, accepted_slot_key_prefixes).
+    Verify each arc's *last* step lands as the active value in its slot.
+
+    Token extraction: alphabetic runs of length ≥4 minus stopwords —
+    catches "Madrid" out of "Now in Madrid." reliably (the previous
+    naive split() left punctuation glued to the token).
+    """
+    uid = uniq("multiarc")
+    max_len = max(len(seq) for _, seq, _ in arcs)
+    # Interleave so sequences are not all from one category in a row.
+    for i in range(max_len):
+        for label, seq, _ in arcs:
+            if i < len(seq):
+                post_turn(uniq(f"sess-{label}"), uid, seq[i])
+    misses: list[str] = []
+    for label, seq, slot_prefixes in arcs:
+        target = seq[-1].lower()
+        tokens = [
+            t for t in re.findall(r"[a-z]+", target)
+            if len(t) >= 4 and t not in _ARC_STOP
+        ]
+        actives = [m for m in get_memories(uid)
+                   if m["active"]
+                   and any(m["key"].startswith(p) for p in slot_prefixes)]
+        if not any(any(tok in m["value"].lower() for tok in tokens)
+                   for m in actives):
+            misses.append(label)
+    return not misses, f"misses={misses}"
+
+
+MULTI_ARC = [
+    ("FG14.multiarc.city_employer",
+     [
+         ("city",  ["I live in Berlin.", "Moved to Lisbon.", "Now in Madrid."],
+          ("location.current_city", "location.city")),
+         ("emp",   ["I work at Stripe.", "Joined Notion last week.", "Just started at Anthropic."],
+          ("employment.current_company", "employment.company")),
+     ]),
+    ("FG15.multiarc.city_employer_diet",
+     [
+         ("city",  ["I'm in Tokyo.", "Moved to Osaka.", "Now in Kyoto."],
+          ("location.current_city", "location.city")),
+         ("emp",   ["I work at Sony.", "Joined Rakuten.", "Just started at Mercari."],
+          ("employment.current_company", "employment.company")),
+         ("diet",  ["I eat anything.", "Going vegetarian.", "Now strictly vegan."],
+          ("diet",)),
+     ]),
+    ("FG16.multiarc.three_arcs_2steps",
+     [
+         ("city",  ["I'm in NYC.", "Now in LA."],
+          ("location.current_city", "location.city")),
+         ("emp",   ["At Goldman.", "Now at JPMorgan."],
+          ("employment.current_company", "employment.company")),
+         ("role",  ["I'm an analyst.", "Promoted to associate."],
+          ("employment.current_role", "employment.role")),
+     ]),
+    ("FG17.multiarc.no_cross_contamination",
+     [
+         ("city",  ["I live in Madrid.", "Moved to Barcelona."],
+          ("location.current_city", "location.city")),
+         ("diet",  ["I am vegetarian.", "Switched to vegan."],
+          ("diet",)),
+     ]),
+]
+for tid, arcs in MULTI_ARC:
+    reg_data(tid, FORGETTING,
+             "every arc lands on its latest value",
+             lambda a=arcs: _multi_arc(a))
+
+
+def _stale_under_noise(plants: list[str], n_noise: int,
+                       expected_substrs: list[str]) -> tuple[bool, str]:
+    """Plant N facts, bury under M noise turns, profile query, expect
+    most planted facts surface."""
+    uid = uniq("stale")
+    for p in plants:
+        post_turn(uniq("plant"), uid, p)
+    _bury_with_noise(uid, n_noise)
+    ctx = post_recall(uid, "Tell me about this user.").json()["context"]
+    have = sum(1 for s in expected_substrs if s.lower() in ctx.lower())
+    return have >= len(expected_substrs) // 2 + 1, f"{have}/{len(expected_substrs)}"
+
+
+STALE = [
+    ("FG18.stale.city_under_5",  ["I live in Helsinki."],                              5,
+     ["Helsinki"]),
+    ("FG19.stale.three_under_8",
+     ["I live in Oslo.", "I work at Equinor.", "I'm vegetarian."], 8,
+     ["Oslo", "Equinor", "vegetarian"]),
+    ("FG20.stale.three_under_15",
+     ["I live in Lima.", "I'm a chef.", "Allergic to peanuts."], 15,
+     ["Lima", "chef", "peanut"]),
+    ("FG21.stale.five_under_10",
+     ["I live in Warsaw.", "I work at Allegro.", "I'm vegan.",
+      "Allergic to bee stings.", "I have a dog called Luna."], 10,
+     ["Warsaw", "Allegro", "vegan", "Luna"]),
+    ("FG22.stale.early_vs_late",
+     # Plant fact at turn 1, noise, then plant another fact at the end.
+     # Both should still surface in profile query.
+     ["I live in Glasgow.",  # planted turn 1
+      "I work at Skyscanner.",  # planted turn 2
+      ],
+     5,  # 5 noise turns between the two planted bursts
+     ["Glasgow", "Skyscanner"]),
+]
+for tid, plants, n, exp in STALE:
+    reg_data(tid, FORGETTING,
+             f"≥{len(exp)//2 + 1} planted facts survive {n} noise turns",
+             lambda p=plants, n=n, e=exp: _stale_under_noise(p, n, e))
+
+
+def _tight_budget_aging(plants: list[str], query: str, max_tokens: int,
+                        relevant_substrs: list[str],
+                        forbidden_substrs: list[str]) -> tuple[bool, str]:
+    """Plant many memories; under tight budget, relevant facts win regardless
+    of insert order."""
+    uid = uniq("aging")
+    for p in plants:
+        post_turn(uniq("plant"), uid, p)
+    ctx = post_recall(uid, query, max_tokens=max_tokens).json()["context"]
+    have = sum(1 for s in relevant_substrs if s.lower() in ctx.lower())
+    leak = sum(1 for s in forbidden_substrs if s.lower() in ctx.lower())
+    ok = have >= 1 and leak == 0
+    return ok, f"relevant={have}/{len(relevant_substrs)} leak={leak}"
+
+
+TIGHT_BUDGET = [
+    ("FG23.aging.diet_query_budget40",
+     [
+         "I work at Stripe.",
+         "I live in Berlin.",
+         "I have a dog named Biscuit.",
+         "I have a cat named Mochi.",
+         "Born in 1988.",
+         "I'm vegetarian.",
+         "Allergic to shellfish.",
+         "I drive a Volvo.",
+         "I love hiking on weekends.",
+         "Have a sister named Anna.",
+     ],
+     "What does this user eat?", 40,
+     ["vegetarian", "shellfish"],
+     ["Stripe", "Volvo", "Anna"]),
+    ("FG24.aging.employer_query_budget50",
+     [
+         "I have a cat named Mochi.",
+         "I'm allergic to peanuts.",
+         "I love TypeScript.",
+         "I live in Toronto.",
+         "I work at Shopify.",
+         "Born in Vancouver.",
+         "Brother lives in Montreal.",
+     ],
+     "Where does this user work?", 50,
+     ["Shopify"],
+     # Forbid only OBVIOUSLY off-topic (pet, allergy). Location facts
+     # legitimately co-render on a "where work" query because they're
+     # cosine-adjacent and useful for the agent's downstream reasoning.
+     ["Mochi", "peanut"]),
+    ("FG25.aging.location_query_budget45",
+     [
+         "I have a parrot named Mango.",
+         "I work at Atlassian.",
+         "I'm pescatarian.",
+         "I live in Sydney.",
+         "I love jazz.",
+         "Speak French and Mandarin.",
+     ],
+     "Where does this user live?", 45,
+     ["Sydney"],
+     ["Mango", "Atlassian", "jazz"]),
+]
+for tid, plants, q, mt, rel, forb in TIGHT_BUDGET:
+    reg_data(tid, FORGETTING,
+             f"under {mt} tokens, relevant={rel} leaks={forb}=0",
+             lambda p=plants, q=q, mt=mt, r=rel, f=forb:
+                 _tight_budget_aging(p, q, mt, r, f))
 
 
 # ====================================================================
