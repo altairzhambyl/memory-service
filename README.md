@@ -132,21 +132,29 @@ latest active opinion. Documented as a known limitation.
 
 End-to-end:
 
-1. **Embed query** with `text-embedding-3-small`.
-2. **In parallel** (`asyncio.gather`) — fetch active memories for
-   `user_id` (type-priority sort: fact > preference > opinion > event,
-   then `updated_at DESC`); and run **hybrid retrieval** over
-   `documents` rows scoped by `user_id`.
-3. **Hybrid retrieval** = cosine top-30 (HNSW on
-   `text-embedding-3-small`) + BM25 top-30 (Postgres `tsvector` +
+1. **Fetch active memories** for `user_id` from Postgres (no embedding
+   needed — direct relational read).
+2. **Embed query** with `text-embedding-3-small`. If this fails (transient
+   OpenAI blip), the `## Known facts` block still renders from step 1;
+   only the conversation block goes cold (/ MS-24).
+3. **Hybrid retrieval over conversation chunks** = cosine top-30 (HNSW on
+   `text-embedding-3-small`) + Postgres FTS top-30 (`tsvector` +
    `ts_rank_cd`), fused via **Reciprocal Rank Fusion** with `k=60`
    (Cormack-Buettcher-Clarke 2009). Cosine catches semantic intent;
-   BM25 catches keyword-anchored queries (rare proper nouns,
-   technical terms) where short-turn embeddings are weak. Per :
-   ranking is deliberate, not vanilla cosine top-k.
-4. **Assemble**: emit the `## Known facts` block first, then drain the
-   remaining budget into `## Relevant from recent conversations`.
-   Snippets are pre-trimmed at index time (240 chars).
+   FTS catches keyword-anchored queries (rare proper nouns, technical
+   terms) where short-turn embeddings are weak. Per : ranking is
+   deliberate, not vanilla cosine top-k.
+4. **Hybrid retrieval over memory rows** (MS-23): the same cosine + FTS
+   + RRF over `kind='memory'` documents — each active memory has a
+   sibling `key: value` document written at /turns time. Returns a
+   `{memory_id: rrf_score}` map used to re-sort the facts block by
+   query similarity.
+5. **Assemble**: emit the `## Known facts` block first (sorted by query
+   similarity DESC, with `(type_priority, updated_at DESC)` as the
+   tail-sort for memories the retriever didn't score), then drain the
+   remaining budget into `## Relevant from recent conversations`. Under
+   tight budget, lowest-similarity facts are dropped first — irrelevant
+   ones never crowd out relevant ones.
 5. **Citations** carry `turn_id`, cosine score, and snippet (cosine
    kept as the citation score for interpretability; ordering is
    by RRF). Memories are not duplicated as citations — reviewers
@@ -204,7 +212,7 @@ judge that adds latency and model-cost variance.
 | One backing store, one transaction, no eventual consistency | LLM reranker / query rewriting / multi-hop graph traversal |
 | Synchronous extraction inside `/turns` (60 s budget) | Throughput on bursts — `max_retries=0` on the hot path means a 429 returns zero memories rather than retrying |
 | Deterministic `(user_id, key)` supersession | LLM-judge contradiction detection — heavier, less predictable |
-| stable-facts-first recall priority | Query-relevant memory layer (similarity over memory rows) — left as a post-MVP refinement |
+| query-aware fact ranking under tight budget | LLM reranker over the fused conversation candidate pool — extra latency we don't yet have evidence the eval rewards |
 | Original prompt, original schema, single Python file per concern | Bigger framework conveniences (no Celery / Kafka / queue) |
 
 ## Failure modes
@@ -239,24 +247,39 @@ judge that adds latency and model-cost variance.
 RAG_E2E=1 .venv/bin/pytest -q tests/
 ```
 
-Expected: **16 passed** (12 contract-shape from `tests/contract/test_contract_shapes.py`
-+ `tests/contract/test_shapes.py`, plus 4 required from
-`tests/contract/test_required_behaviors.py`: synchronous availability,
-concurrent-session isolation, malformed input no crash, restart
-persistence). The restart test invokes `docker compose restart app`
-via subprocess; it is auto-skipped when the docker CLI isn't on PATH.
+Expected: **22 passed** — 12 contract-shape from
+`tests/contract/test_contract_shapes.py` + `tests/contract/test_shapes.py`,
+plus 10 /MS-{20,23,24} cases from `tests/contract/test_required_behaviors.py`:
+synchronous availability, concurrent-session isolation, malformed input
+no crash, restart persistence (MS-20); transient embed-failure on
+/turns survives, /recall returns facts when embed fails, /recall fully
+cold when embed fails and no memories, fixture runner aggregates
+failures, both-upstream-fail returns 503 (MS-24); query-aware memory
+ranking under tight budget (MS-23). The restart test invokes
+`docker compose restart app` via subprocess; it is auto-skipped when
+the docker CLI isn't on PATH.
 
-The recall-quality fixture is a separate, measured eval:
+The recall-quality fixtures are a separate, measured eval:
 
 ```bash
+# v1 — easy floor; every probe is a near-paraphrase of one turn.
 curl -sX POST http://localhost:8080/admin/run_fixture \
   -H 'Content-Type: application/json' -d '{"name":"v1"}' | jq .aggregate
+
+# v2 — multi-hop, keyword-anchored, supersession arcs, tight-budget probes.
+curl -sX POST http://localhost:8080/admin/run_fixture \
+  -H 'Content-Type: application/json' -d '{"name":"v2"}' | jq .aggregate
 ```
 
-Or click **Run fixture** in card 5 of the inspection UI. v1 has 7
+Or click **Run fixture** in card 5 of the inspection UI. **v1** has 7
 probes (6 positive + 1 noise) over 3 conversations
-(fix-berlin / fix-pet / fix-diet); current run reports recall@1=6/6,
-recall@3=6/6, noise=1/1, mean top-score=0.356, extraction_failures=0/5.
+(fix-berlin / fix-pet / fix-diet); current run reports
+`recall@1=6/6, recall@3=6/6, noise=1/1, mean=0.356, extraction_failures=0/5`.
+**v2** has 8 probes covering categories — multi-hop linkage,
+keyword-anchored vs distractor, tight-budget priority assembly,
+supersession arcs (employer + opinion), adversarial noise, implicit
+fact extraction; current run reports `multihop@1=1/1, facts=6/6,
+forbidden_violations=0, supersession=1/1, noise=1/1, mean=0.450`.
 
 ## Repo layout
 
@@ -274,8 +297,8 @@ memory-service/
 │   └── static/index.html      # inspection UI (every endpoint)
 ├── migrations/                # 001_init, 002_chat_sessions,
 │                                003_turns, 004_memories,
-│                                005_bm25_hybrid
-├── fixtures/recall/v1.json    # 7-probe recall-quality fixture
+│                                005_bm25_hybrid, 006_memory_documents
+├── fixtures/recall/            # v1 (easy floor) + v2 (stress probes)
 ├── tests/contract/            # shape tests + required tests
 ├── docker-compose.yml         # db + app, named volume rag-db-data
 ├── Dockerfile
