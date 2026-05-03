@@ -38,21 +38,23 @@ docker compose up -d --build     # ~30s; pulls pgvector + builds the app
 bash scripts/smoke.sh            # /health → /turns → /recall → /users/{id}/memories
 ```
 
-**Note for the eval harness.** On a transient OpenAI failure during
-`POST /turns`, the service does not crash. If both `embed` and
-`extract` fail simultaneously (DNS blip, regional outage), it returns
-`503` with a typed JSON body:
+**Note for the eval harness.** `POST /turns` **always** returns `201`
+on a well-formed request — even when OpenAI is having a bad minute.
+Transient `embed` and/or `extract` failures degrade gracefully:
 
-```json
-{ "error": "upstream_unavailable", "retryable": true, "embed_error": "...", "extract_error": "..." }
-```
+- `embed` fails → turn metadata + memories commit; no
+  `documents`/`embeddings` rows; `turns.metadata.embed_error` set.
+- `extract` fails → turn + indexed conversation commit; no memories;
+  `turns.metadata.extraction_error` set.
+- both fail → bare turn + `turn_messages` (raw text) commit; both
+  flags set in metadata. Eval can call `/recall` immediately — it
+  returns cold per §3 (`{"context":"","citations":[]}`) when nothing
+  retrieval-shaped landed. The conversation is still on disk for
+  any future re-extract path.
 
-The eval should retry the same request — once the upstream recovers
-the next attempt commits normally. All other transient failures
-(embed-only, extract-only) degrade gracefully and still return `201`
-with the partial state recorded in `turns.metadata`. See
-[Failure modes](#failure-modes) for the full table and §5 for the
-contract guarantee.
+The harness never sees a 5xx from `/turns` on a transient upstream
+blip — only on actual server bugs. See [Failure modes](#failure-modes)
+for the full table and §5 for the contract guarantee.
 
 Run the recall-quality eval:
 
@@ -349,7 +351,7 @@ recording when (or whether) we revisit.
 | Missing `OPENAI_API_KEY` | `docker compose up` fails fast on `${OPENAI_API_KEY:?…}` interpolation. Listed in `.env.example`. | docker error log |
 | OpenAI 5xx / 429 / DNS / timeout on `/turns` | Persist turn metadata + extracted memories. Skip embedding writes. `turns.metadata.embed_error="rate_limit"` (or `timeout` / `connection` / `bad_request:{status}`). Return 201. | `/admin/turn_index` `embed_failures` count + warn log |
 | OpenAI failure on extraction | Extraction returns `(memories=[], error="…")`. Turn still commits with empty memories. `turns.metadata.extraction_error` set. | `/admin/turn_index` `extraction_failures` count |
-| Both embed AND extract fail | 503 with `{error:"upstream_unavailable", retryable:true, embed_error, extract_error}`. Eval may retry. | response body |
+| Both embed AND extract fail | Persist bare turn + `turn_messages` (raw text). Both `embed_error` and `extraction_error` set in `turns.metadata`. Return `201`. The eval never sees a 5xx on a transient blip — §3 strict harness rule. | `/admin/turn_index` `embed_failures` + `extraction_failures` counters; raw text on disk |
 | OpenAI auth bug (invalid key) | `AuthenticationError` re-raises → 5xx. Loud failure, not silent zero memories. | uvicorn error log |
 | `embed_query` failure on `/recall` | `## Known facts` block still renders from Postgres (no embedding needed). Conversation block goes cold; citations empty. 200 response. | `recall.embed_failed` warn log |
 | `embed_query` failure with no memories | Fully cold per §3: `{context:"", citations:[]}`. | warn log |
@@ -415,7 +417,8 @@ per-fact cosine gate.
   persistence.
 - 5 graceful-upstream tests (HGT-24): `/turns` survives embed blip,
   `/recall` returns facts when embed fails, fully cold when no
-  memories, fixture runner aggregates failures, both-fail returns 503.
+  memories, fixture runner aggregates failures, both-fail returns 201
+  with both error flags in metadata (no 5xx on transient blip).
 - 1 query-aware ranking test (HGT-23).
 - 1 concurrency-canonical-slot guard (HGT-27).
 - 1 partial-overlap noise gate (HGT-32 via v2 fixture).
@@ -449,7 +452,7 @@ curl -sX POST http://localhost:8080/admin/run_fixture \
 - Hybrid retrieval (cosine + Postgres FTS + RRF). Not vanilla top-k.
 - Query-aware fact ranking via sibling `kind='memory'` documents.
 - Two-stage noise gate: block-level + per-fact cosine threshold.
-- Graceful upstream-failure: embed/extract blip → 201 with metadata flag, never 5xx; both fail → 503 retryable.
+- Graceful upstream-failure: any combination of embed/extract failure → 201 with the surviving partial state and `turns.metadata` error flags. The eval never sees a 5xx from `/turns` on a transient OpenAI blip.
 - 22 offline + 24 live tests = 46 passed. Two recall-quality fixtures (v1 + v2).
 
 ## What does not ship

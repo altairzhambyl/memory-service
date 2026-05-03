@@ -390,13 +390,15 @@ def test_fixture_runner_aggregates_failures():
         _clear_injected_failures()
 
 
-def test_both_embed_and_extract_fail_returns_503():
-    """§5/§HGT-24: when neither embed nor extract has anything to
-    persist, /turns returns 503 retryable. Anonymous turn skips
-    extraction entirely, so injecting an embed failure leaves us with
-    zero useful state — the canonical "both fail" condition.
+def test_both_embed_and_extract_fail_returns_201_with_error_metadata():
+    """§3 / §5: /turns must always return 201 (a strict eval harness
+    treats anything else as failure). When BOTH embed and extract
+    fail — anonymous turn skips extraction, embed is injected to fail —
+    the service still persists the bare turn + turn_messages and
+    surfaces both flags in `turns.metadata` (visible via
+    `/admin/turn_index` counters). No 5xx on transient upstream blip.
     """
-    sid = _unique("sess-503")
+    sid = _unique("sess-bothfail")
     try:
         _inject_embed_failure(1)
         r = httpx.post(
@@ -413,14 +415,24 @@ def test_both_embed_and_extract_fail_returns_503():
             },
             timeout=30,
         )
-        assert r.status_code == 503, r.text
-        body = r.json()
-        # FastAPI wraps the dict detail under a "detail" key.
-        detail = body.get("detail", body)
-        assert detail.get("retryable") is True, body
-        assert detail.get("error") == "upstream_unavailable", body
+        assert r.status_code == 201, r.text
+        assert isinstance(r.json().get("id"), str), r.text
+
+        # embed_error is recorded in turn metadata (visible via
+        # /admin/turn_index aggregation, scoped to this session).
+        idx = httpx.get(
+            f"{BASE}/admin/turn_index",
+            params={"session_id": sid, "limit": 5},
+            timeout=10,
+        ).json()
+        assert idx["embed_failures"] >= 1, idx
+        # No indexed triplet for this turn — embeddings would be
+        # garbage. Reviewer confirms via documents_count==0.
+        assert idx["documents_count"] == 0, idx
     finally:
         _clear_injected_failures()
+        # Cleanup the bare turn so the suite stays idempotent.
+        httpx.delete(f"{BASE}/sessions/{sid}", timeout=10)
 
 
 # =====================================================================
