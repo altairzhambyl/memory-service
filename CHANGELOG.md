@@ -206,3 +206,22 @@ Threshold tuning: empirically calibrated против v1+v2 probe scores. v1 pos
 * README §Recall strategy обновлён — gate signals + thresholds + degraded-mode bypass документированы.
 
 **Линковка:** HGT-25 → Done, HGT-29 → Done. Codex audit triage 5/7 closed. Remaining: HGT-30 (offline tests, Patch C), HGT-31 (smoke script, Patch D).
+
+2026-05-03
+HGT-30 (Patch C) — offline test floor for pure recall helpers — §7
+Codex evidence: `pytest -q` без `RAG_E2E=1` collected 22, skipped 22 — README claimed unit/contract-shape tests run без флага, но не one не run'ил. Local regression checks полностью depended на Docker + OpenAI.
+Fix: `tests/unit/test_recall_helpers.py` — 19 deterministic tests on pure helpers, no DB, no OpenAI, completes in <1s. Coverage:
+* `_canonicalise_slot` (HGT-26) — 4 tests: employer aliases collapse, location aliases collapse, opinion-hierarchical collapse, fallback for unknown keys.
+* `_parse_known_facts_block` — 3 tests: extract pairs in render order, empty when block absent, empty context handles.
+* `_facts_block_relevant` (HGT-25) — 5 tests: memory-score signal, conversation-score signal, all-below-threshold blocks, profile regex bypasses scores, `memory_scores=None` HGT-24 degraded-mode bypass.
+* `_format_recall_context` — 7 tests: cold-empty when nothing, drop facts section if budget < header+line (HGT-29), render when budget admits header+1 line, query-aware sort promotes relevant under tight budget (HGT-23), filter low-score conversation hits (HGT-25), keep above-threshold hits, render facts in degraded mode regardless of off-topic query.
+
+The helpers are imported directly from `app.api.routes` — they're already pure functions (no DB pool dependency at import time). Module import constructs FastAPI router but doesn't init the pool or hit OpenAI; both are lazy.
+
+**Verification:**
+* Plain `.venv/bin/pytest -q tests/` → **19 passed, 23 skipped** (was 0 passed, 22 skipped).
+* `RAG_E2E=1 .venv/bin/pytest -q tests/` → **42 passed** (19 unit + 23 live-stack).
+
+README's «How to run tests» section restructured into two tiers — offline floor (always-runs) and live-stack (gated). Reviewer running plain `pytest` now gets a fast deterministic signal на pure recall logic; live-stack tests stay gated behind `RAG_E2E=1` так как они нуждаются в Docker + real OpenAI key.
+
+**Линковка:** HGT-30 → Done. Codex audit triage 6/7 closed; only HGT-31 (smoke script + src/ rename) remains — cosmetic, Patch D.
