@@ -1,9 +1,24 @@
-# Memory Service
+# Memory Service — `with-ui` branch
 
 A Dockerised memory service for an AI agent. Ingests conversation turns,
 extracts typed structured memories, and answers recall queries with a
 priority-assembled context. Implements the HTTP contract from the
 the project's private working notes (`CLAUDE.md`).
+
+> **Branches.** This branch (`with-ui`) ships the inspection UI at
+> `http://localhost:8080/` — every endpoint has a card with editable
+> JSON, response viewer, and verdict pills (recall fixture, memories,
+> turn index). Use this branch if you want to drive the service by
+> clicking instead of `curl`.
+>
+> The `main` branch is the **service-only** build — no static UI, no
+> `/` route, smaller image. Use `main` if you only need the HTTP
+> surface for an agent or eval to call.
+>
+> ```bash
+> git clone -b with-ui git@github.com:kekeront/ai-memory.git   # this branch
+> git clone               git@github.com:kekeront/ai-memory.git   # main = service only
+> ```
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
