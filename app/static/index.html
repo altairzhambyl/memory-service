@@ -1367,12 +1367,21 @@
         const verdict = p.is_noise
           ? `<span class="s3-verdict ${p.passed ? "pass" : "fail"}">${p.passed ? "noise OK" : "noise FAIL"}</span>`
           : `<span class="s3-verdict ${p.passed ? "pass" : "fail"}">${p.passed ? "PASS" : "FAIL"}</span>`;
-        const expected = p.is_noise ? "—" : escapeHtml(p.expected_turn_label || "");
+        const expected = p.is_noise
+          ? "—"
+          : (p.expected_turn_label
+              ? escapeHtml(p.expected_turn_label)
+              : (p.expected_known_facts_total
+                  ? `facts ${p.expected_known_facts_present}/${p.expected_known_facts_total}`
+                  : "—"));
         const got = escapeHtml(p.top_hit_turn_label || "—");
         const subs = p.is_noise
           ? "—"
           : (p.expected_substrings.length ? `<span class="s3-verdict ${p.substring_match ? "pass" : "fail"}">${p.substring_match ? "✓" : "✗"}</span>` : "—");
-        const top3 = p.is_noise ? "—" : (p.passed_top3 ? "✓" : "✗");
+        // top3 only meaningful when an expected_turn_label is set; otherwise N/A.
+        const top3 = (p.is_noise || !p.expected_turn_label)
+          ? "—"
+          : (p.passed_top3 ? "✓" : "✗");
         const cls = p.passed ? "row-pass" : "row-fail";
         return `<tr class="${cls}">
           <td>${escapeHtml(p.label)}</td>
