@@ -264,6 +264,17 @@
       "expected_top_score_under": 0.30
     },
     {
+      "_purpose": "MS-25 noise-resistance: known user with structured memories must NOT receive identity facts when the query is off-topic. Asserts the relevance gate, not just citation top-score.",
+      "label": "noise-typed-user-empty-context",
+      "query": "What is the user's opinion on quantum computing?",
+      "user_id": "fix-tight-budget-mix",
+      "session_id": "fix-tight-budget-mix-recall",
+      "max_tokens": 1024,
+      "noise": true,
+      "expected_top_score_under": 0.30,
+      "expected_empty_context": true
+    },
+    {
       "label": "implicit-pet",
       "query": "Does this user have any pets?",
       "user_id": "fix-imp-pet",

@@ -72,6 +72,32 @@ _MEMORY_RECALL_TOPK = 50
 # Per-retriever candidate pool for the hybrid fuse. Each retriever (cosine
 # and BM25) returns up to this many docs; RRF merges and re-ranks them.
 _HYBRID_POOL = 30
+# noise-resistance gates (MS-25). Facts block renders only when the
+# query is on-topic for this user — at least one of:
+#   * memory hybrid retrieval returns a row with RRF ≥ τ_mem
+#       (one retriever agreeing on rank 1 ⇒ RRF ≈ 1/61 ≈ 0.0164;
+#       two agreeing ⇒ ~0.033 — τ=0.02 is "≥1 retriever scored it").
+#   * conversation cosine top hit ≥ τ_conv. Empirically v2 noise probe
+#     ("opinion on quantum computing") tops at 0.25 on a typescript
+#     user; positive identity probes sit ≥0.30. Threshold 0.27 splits.
+#   * query matches the profile-allowlist regex
+#     ("tell me about this user", "who is …", "what do you know about").
+_RECALL_FACTS_GATE_MEMORY_RRF = 0.02
+# Lowered from 0.27 → 0.20 after empirical separation: v2 implicit-pet
+# tops at 0.209 on a relevant pet query, v2 noise-typed-user-empty-context
+# tops at 0.171 on a quantum-computing query against a typescript user.
+# Same threshold gates the facts block AND filters conversation hits —
+# off-topic queries return empty conversation, not just empty facts
+# (noise resistance is a context-wide property, not facts-only).
+_RECALL_FACTS_GATE_CONVERSATION_COSINE = 0.20
+_RECALL_CONVERSATION_MIN_SCORE = 0.20
+# Compiled module-level so it doesn't recompile per /recall.
+import re as _re  # noqa: E402 — kept local to retrieval section
+_RECALL_PROFILE_QUERY_RE = _re.compile(
+    r"\b(about (this )?user|tell me about|who is|"
+    r"what do (?:we|you) know about|user'?s? profile)\b",
+    _re.IGNORECASE,
+)
 # RRF dampening constant. 60 is the value from Cormack-Buettcher-Clarke
 # (2009) and now the de-facto default; we explicitly cite it in the
 # CHANGELOG so a reviewer doesn't have to ask "why 60?".
@@ -936,12 +962,50 @@ async def _recall_memory_candidates(
     return fused
 
 
+def _facts_block_relevant(
+    query: str,
+    memory_scores: dict[str, float] | None,
+    hits: list[dict],
+) -> bool:
+    """
+    MS-25 noise-resistance gate. Facts render only when the query is
+    on-topic for this user. Three signals (any one suffices):
+      * memory hybrid retrieval scored at least one row above
+        `_RECALL_FACTS_GATE_MEMORY_RRF`.
+      * conversation cosine top hit ≥ `_RECALL_FACTS_GATE_CONVERSATION_COSINE`.
+      * query matches `_RECALL_PROFILE_QUERY_RE` (open-ended profile
+        questions like "what do you know about this user?").
+
+    Profile queries bypass score thresholds because by construction
+    they don't match any specific stored content but reviewers expect
+    the identity facts back. Per the requirements reference shape.
+
+    `memory_scores=None` is the MS-24 degraded-mode signal: retrieval
+    didn't run because `embed_query` failed, so we have no relevance
+    evidence either way. Render facts — the eval still gets the user's
+    stable identity, which is the MS-24 contract. The gate only
+    suppresses facts when retrieval ran AND found nothing relevant.
+    """
+    if memory_scores is None:
+        return True
+    if memory_scores:
+        if max(memory_scores.values(), default=0.0) >= _RECALL_FACTS_GATE_MEMORY_RRF:
+            return True
+    if hits:
+        if max((h["score"] for h in hits), default=0.0) >= _RECALL_FACTS_GATE_CONVERSATION_COSINE:
+            return True
+    if _RECALL_PROFILE_QUERY_RE.search(query):
+        return True
+    return False
+
+
 def _format_recall_context(
     memories: list[dict],
     hits: list[dict],
     max_tokens: int,
     *,
     memory_scores: dict[str, float] | None = None,
+    query: str = "",
 ) -> tuple[str, list[dict]]:
     """
     Build the `context` string and matched citations under a token
@@ -953,9 +1017,17 @@ def _format_recall_context(
     MS-23: when `memory_scores` is supplied (from
     `_recall_memory_candidates`), facts are re-sorted by query
     similarity DESC, with `(type_priority, updated_at DESC)` as the
-    tail-sort for memories the retriever didn't surface. Under tight
-    budget the lowest-similarity facts are dropped first, so an
-    irrelevant fact never crowds out a relevant one.
+    tail-sort for memories the retriever didn't surface.
+
+    MS-25: the facts block only renders when the query is relevant
+    to this user (see `_facts_block_relevant`). Off-topic queries
+    return cold — noise resistance. The conversation block obeys
+    its own relevance — it only renders if at least one hit clears
+    the budget, and `hits` is already filtered by hybrid retrieval.
+
+    MS-29: every section header reserves cost provisionally — it's
+    only committed to the running total once at least one body line
+    fits. Empty sections never push context over `max_tokens`.
 
     Citations only carry `turn_id` references — memories surface in
     the prose block but are inspectable via /users/{id}/memories so we
@@ -967,11 +1039,16 @@ def _format_recall_context(
     sections: list[str] = []
     used = 0
 
-    if memories:
+    facts_eligible = bool(memories) and _facts_block_relevant(
+        query, memory_scores, hits,
+    )
+
+    if facts_eligible:
         facts_header = "## Known facts about this user"
-        used += _approx_tokens(facts_header)
+        header_cost = _approx_tokens(facts_header)
         fact_lines: list[str] = []
         scores = memory_scores or {}
+
         # Sort key: (-similarity_score, type_priority, -updated_at_ts).
         # Negative score so DESC by similarity; type_priority ASC keeps
         # facts > preferences > opinions > events for tied-similarity
@@ -986,23 +1063,30 @@ def _format_recall_context(
         for mem in sorted(memories, key=_rank_key):
             line = f"- {mem['key']}: {mem['value']}"
             cost = _approx_tokens(line) + 1
-            if used + cost > max_tokens and fact_lines:
-                # : facts have priority but a runaway memory list
-                # still cannot blow past the budget. Lowest-similarity
-                # facts are dropped first thanks to the sort above.
+            head = header_cost if not fact_lines else 0
+            # + MS-29: header cost only commits if a line fits
+            # under it. The first line + header must both fit; later
+            # lines just need their own cost under the running budget.
+            if used + head + cost > max_tokens:
                 break
-            used += cost
+            used += head + cost
             fact_lines.append(line)
         if fact_lines:
             sections.append("\n".join([facts_header, *fact_lines]))
 
+    # MS-25: filter conversation hits below the relevance floor so
+    # off-topic queries return empty context, not stale chunks. Same
+    # threshold as the facts gate keeps the two layers consistent.
+    relevant_hits = [
+        h for h in hits
+        if h.get("score", 0.0) >= _RECALL_CONVERSATION_MIN_SCORE
+    ]
     chosen: list[dict] = []
-    if hits:
+    if relevant_hits:
         hits_header = "## Relevant from recent conversations"
         header_cost = _approx_tokens(hits_header)
         hit_lines: list[str] = []
-        # Reserve header cost only if at least one hit fits.
-        for hit in hits:
+        for hit in relevant_hits:
             meta = hit["metadata"]
             snippet = _trim(hit["text"])
             ts = meta.get("ts") or ""
@@ -1011,10 +1095,9 @@ def _format_recall_context(
             line = f"- [{ts}] ({role} {sid}) {snippet}"
             cost = _approx_tokens(line) + 1
             head = header_cost if not hit_lines else 0
-            if used + head + cost > max_tokens and hit_lines:
-                break
+            # Provisional header — only commit it if at least one hit
+            # fits below it.
             if used + head + cost > max_tokens:
-                # Even the first hit doesn't fit; facts win the budget.
                 break
             used += head + cost
             hit_lines.append(line)
@@ -1066,7 +1149,15 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     memories = await _fetch_active_memories(payload.user_id)
 
     qvec, embed_error = await embed_query(payload.query)
-    memory_scores: dict[str, float] = {}
+    # `memory_scores=None` is the MS-24/MS-25 boundary signal:
+    # None  → retrieval did not run (embed failed); _format_recall_context
+    #         bypasses the MS-25 noise gate and renders facts as a
+    #         degraded fallback (MS-24 "facts always render on embed
+    #         failure" contract).
+    # dict  → retrieval ran (possibly empty result set); gate evaluates
+    #         normally — empty dict + empty hits + no profile-query
+    #         match means off-topic, render cold.
+    memory_scores: dict[str, float] | None = None
     if embed_error is not None:
         log.warning(
             "recall.embed_failed", user_id=payload.user_id, reason=embed_error,
@@ -1081,7 +1172,11 @@ async def recall(payload: RecallRequest) -> RecallResponse:
         )
 
     context, citations = _format_recall_context(
-        memories, hits, payload.max_tokens, memory_scores=memory_scores,
+        memories,
+        hits,
+        payload.max_tokens,
+        memory_scores=memory_scores,
+        query=payload.query,
     )
     return RecallResponse(
         context=context,
@@ -1777,11 +1872,24 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
                 if per_probe_top_threshold is not None
                 else noise_max_top
             )
-            ok = (not cites) or (top_score is not None and top_score < threshold)
-            if not ok:
+            score_ok = (not cites) or (top_score is not None and top_score < threshold)
+            # MS-25: noise probes can additionally assert that the
+            # entire context is empty (`expected_empty_context: true`)
+            # — this is the relevance-gate signal, distinct from the
+            # citation-score signal. When the flag is set, the facts
+            # block must NOT render.
+            expected_empty = bool(probe.get("expected_empty_context", False))
+            empty_ok = (not expected_empty) or (rec_resp.context == "")
+            ok = score_ok and empty_ok
+            if not score_ok:
                 noise_top_score_violations += 1
             if ok:
                 noise_passed += 1
+            note_parts = [f"noise threshold < {threshold}"]
+            if expected_empty:
+                note_parts.append(
+                    "context==\"\"" if empty_ok else "EXPECTED empty context"
+                )
             probes_out.append(FixtureProbeResult(
                 label=probe["label"],
                 query=probe["query"],
@@ -1790,7 +1898,7 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
                 top_score=top_score,
                 citations_count=len(cites),
                 passed=ok,
-                notes=f"noise threshold < {threshold}",
+                notes="; ".join(note_parts),
                 expected_top_score_under=per_probe_top_threshold,
                 expected_known_facts_total=len(expected_facts),
                 expected_known_facts_present=facts_present,

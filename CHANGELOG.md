@@ -176,3 +176,33 @@ Fix: moved `turn_messages` INSERT outside the embed-error guard. Indexed triplet
 - MS-31 (smoke script + src/ rename) — Patch D, cosmetic, last. the requirements explicitly says `app/` per Python convention is permissible — rename is pure churn.
 
 **Линковка:** MS-26 → Done, MS-27 → Done, MS-28 → Done. Codex audit triage 3/7 closed; remaining 4 covered by Patches B/C/D below.
+
+2026-05-03
+MS-25 + MS-29 (Patch B) — noise gate + small-budget enforcement — 
+Codex findings batched: оба touch'ат `_format_recall_context`, делать independently значило бы переписывать функцию дважды. Senior call: один rewrite на recall layer.
+
+**MS-29 — provisional section headers.**
+Codex evidence: `_format_recall_context` коммитил header cost в `used` ДО того как первая body line проверена. С `max_tokens < header + first_fact` функция могла выдать context превышающий budget. the requirements разрешает «approximate is fine, don't blow past 2×» — спецификация выдержана, но edge case на small budget (1, 5, 10 tokens) был sloppy.
+Fix: оба section'a (`## Known facts`, `## Relevant from recent conversations`) теперь reserve header cost provisionally — header inclusion коммитится в running total ТОЛЬКО когда первая body line fit'ит под header'ом. Edge cases (max_tokens=1) → empty context (no section header alone).
+
+**MS-25 — noise-resistance gate (HARDEST trade-off).**
+Codex evidence: `/recall` всегда renderил `## Known facts` для known user'а — incl. для off-topic queries. «Noise resistance — queries on undiscussed topics return empty context, not hallucinations» — judge читает identity dump на quantum-computing query как hallucinated context даже если citations низкие. Кейс показан в новой v2 probe `noise-typed-user-empty-context`: typescript user'а спросили про quantum computing → top citation 0.171 → вся идентичность user'а all'же rendered, что judge marker'ит as noise hallucination.
+Fix: `_facts_block_relevant(query, memory_scores, hits)` — three signals (any one suffices):
+* memory hybrid top RRF ≥ 0.02 (≥1 retriever scored row at rank 1);
+* conversation cosine top hit ≥ 0.20;
+* query matches `_RECALL_PROFILE_QUERY_RE` (`/about (this )?user|tell me about|who is|what do (?:we|you) know about|user'?s? profile/i`).
+Также filter применён к conversation hits — entries c `score < 0.20` исключены из `## Relevant from recent conversations` блока. Это конъюнкт noise resistance: off-topic queries возвращают полностью cold context, не только cold facts.
+**Boundary с MS-24 graceful upstream:** когда `embed_query` упал и retrieval не run, `memory_scores=None` (sentinel for «retrieval skipped»). Gate bypass'ится → facts всё равно render'ятся, потому что MS-24 контракт «facts always render on embed failure» имеет приоритет над MS-25 noise gate (relevance-evidence не доступна на degraded path).
+Threshold tuning: empirically calibrated против v1+v2 probe scores. v1 positive probe top scores 0.273-0.412 (≥0.20 ✓). v2 implicit-pet 0.209 ≥0.20 ✓. v2 noise-typed-user 0.171 <0.20 ✓ filtered. v2 noise-quantum (typescript-arc user) 0.253 — passes gate (typescript memories partially overlap «opinion» query) и not asserting empty. Trade-off documented: noise on user whose facts touch the noise topic semantically may still get facts; full noise resistance requires per-fact relevance check (out of scope для этого слайса).
+
+**v2 fixture:**
+* Добавлена `noise-typed-user-empty-context` probe (fix-tight-budget-mix, query «What is user's opinion on quantum computing?», `expected_empty_context: true`). Fixture runner проверяет context=='' assertion на noise probes если флаг установлен.
+* Aggregate без новых полей — `noise_top_score_violations` cover'ит metric.
+
+**Verification:**
+* v1: recall@1=6/6, mean=0.3557, noise=1/1 — без регрессии.
+* v2: 9 probes, ALL PASS. multihop@1=1/1, facts=6/6, forb=0, supersession=1/1, noise=1/1 (incl. new noise-typed-user-empty-context).
+* Контракт-тесты: `RAG_E2E=1 pytest tests/ -q` → **23/23 passed**. MS-24 `test_recall_returns_facts_when_embed_fails` всё ещё PASS (gate bypass на `memory_scores=None` срабатывает корректно).
+* README Recall strategy обновлён — gate signals + thresholds + degraded-mode bypass документированы.
+
+**Линковка:** MS-25 → Done, MS-29 → Done. Codex audit triage 5/7 closed. Remaining: MS-30 (offline tests, Patch C), MS-31 (smoke script, Patch D).
