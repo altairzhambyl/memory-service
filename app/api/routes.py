@@ -35,12 +35,15 @@ from app.api.schemas import (
     SearchHit,
     SearchRequest,
     SearchResponse,
+    SeedMemoriesRequest,
+    SeedMemoriesResponse,
     TurnIndexResponse,
     TurnIndexRow,
     TurnMessage,
     TurnRequest,
     TurnResponse,
     UserMemoriesResponse,
+    UserMemory,
 )
 from app.config import get_settings
 from app.db.pool import get_pool
@@ -645,18 +648,55 @@ async def search(payload: SearchRequest) -> SearchResponse:
 
 @router.get("/users/{user_id}/memories", response_model=UserMemoriesResponse)
 async def list_user_memories(user_id: str) -> UserMemoriesResponse:
-    """Cold shape until HGT-17 populates structured memories."""
-    _ = user_id
-    return UserMemoriesResponse(memories=[])
+    """
+    Return typed structured memories for the user (§3 inspection
+    endpoint). Default ordering: most-recently updated first so the
+    reviewer sees the freshest state at the top. We return active rows
+    only by default — superseded history will surface once HGT-18
+    introduces the supersession chain and a `?include_inactive=true`
+    flag is needed.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT  id, user_id, type, key, value, confidence,
+                    source_session, source_turn,
+                    created_at, updated_at, supersedes, active
+            FROM    memories
+            WHERE   user_id = $1 AND active = TRUE
+            ORDER BY updated_at DESC, id ASC
+            """,
+            user_id,
+        )
+    return UserMemoriesResponse(
+        memories=[
+            UserMemory(
+                id=r["id"],
+                type=r["type"],
+                key=r["key"],
+                value=r["value"],
+                confidence=float(r["confidence"]),
+                source_session=r["source_session"],
+                source_turn=r["source_turn"],
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+                supersedes=r["supersedes"],
+                active=r["active"],
+            )
+            for r in rows
+        ]
+    )
 
 
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_section3_session(session_id: str) -> Response:
     """
-    Drop every turn for the §3 string session_id. turn_messages cascades
-    via FK; the indexed documents/embeddings rows we wrote at /turns time
-    have no FK back to turns, so we delete them by provenance metadata in
-    the same transaction.
+    Drop every turn for the §3 string session_id, plus the indexed
+    documents/embeddings rows and any structured memories whose
+    provenance points at this session. turn_messages cascade via FK;
+    documents and memories have no FK to turns so they are deleted
+    explicitly in the same transaction.
     """
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
@@ -668,13 +708,17 @@ async def delete_section3_session(session_id: str) -> Response:
             """,
             session_id,
         )
+        await conn.execute(
+            "DELETE FROM memories WHERE source_session = $1",
+            session_id,
+        )
         await conn.execute("DELETE FROM turns WHERE session_id = $1", session_id)
     return Response(status_code=204)
 
 
 @router.delete("/users/{user_id}", status_code=204)
 async def delete_section3_user(user_id: str) -> Response:
-    """Drop every turn + indexed message for this user across all sessions."""
+    """Drop every turn, indexed message, and structured memory for this user."""
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
@@ -685,6 +729,7 @@ async def delete_section3_user(user_id: str) -> Response:
             """,
             user_id,
         )
+        await conn.execute("DELETE FROM memories WHERE user_id = $1", user_id)
         await conn.execute("DELETE FROM turns WHERE user_id = $1", user_id)
     return Response(status_code=204)
 
@@ -913,4 +958,78 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         aggregate=aggregate,
         probes=probes_out,
         elapsed_ms=elapsed_ms,
+    )
+
+
+# =====================================================================
+# Demo seeder for HGT-17a-i. Writes the "ideal extraction" rows for the
+# v1 fixture users so the GET /users/{user_id}/memories read path + UI
+# table can be exercised before the real LLM extractor lands in
+# HGT-17a-ii. Each call wipes the user's existing memories first so
+# re-runs are idempotent. Restricted to known fix-* user_ids — we don't
+# pretend to have ground-truth extractions for arbitrary users.
+# =====================================================================
+
+
+_SEED_MEMORIES: dict[str, list[dict[str, object]]] = {
+    "fix-berlin": [
+        {"type": "fact",       "key": "location.city",             "value": "Berlin",            "confidence": 0.95},
+        {"type": "fact",       "key": "location.previous_city",    "value": "NYC",               "confidence": 0.90},
+        {"type": "fact",       "key": "employment.company",        "value": "Notion",            "confidence": 0.95},
+        {"type": "fact",       "key": "employment.role",           "value": "Product Manager",   "confidence": 0.90},
+        {"type": "fact",       "key": "employment.previous_company","value": "Stripe",           "confidence": 0.90},
+    ],
+    "fix-pet": [
+        {"type": "fact",       "key": "pet.name",                  "value": "Biscuit",           "confidence": 0.95},
+        {"type": "fact",       "key": "pet.species",               "value": "beagle",            "confidence": 0.95},
+        {"type": "fact",       "key": "pet.age_years",             "value": "3",                 "confidence": 0.85},
+    ],
+    "fix-diet": [
+        {"type": "preference", "key": "diet.style",                "value": "vegetarian",        "confidence": 0.95},
+        {"type": "fact",       "key": "allergy",                   "value": "shellfish",         "confidence": 0.95},
+        {"type": "preference", "key": "beverage.coffee",           "value": "no",                "confidence": 0.85},
+    ],
+}
+
+
+@router.post("/admin/seed_memories", response_model=SeedMemoriesResponse)
+async def admin_seed_memories(payload: SeedMemoriesRequest) -> SeedMemoriesResponse:
+    """Demo-grade seeder so the §3 inspection endpoint has something to show."""
+    if payload.user_id not in _SEED_MEMORIES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no_seed_template_for:{payload.user_id} (known: {sorted(_SEED_MEMORIES)})",
+        )
+
+    rows = _SEED_MEMORIES[payload.user_id]
+    pool = get_pool()
+    async with pool.acquire() as conn, conn.transaction():
+        deleted = await conn.fetchval(
+            "WITH d AS (DELETE FROM memories WHERE user_id = $1 RETURNING 1) SELECT count(*) FROM d",
+            payload.user_id,
+        )
+        for row in rows:
+            await conn.execute(
+                """
+                INSERT INTO memories (
+                    id, user_id, type, key, value, confidence,
+                    source_session, source_turn,
+                    supersedes, active
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, TRUE)
+                """,
+                str(uuid.uuid4()),
+                payload.user_id,
+                row["type"],
+                row["key"],
+                row["value"],
+                float(row["confidence"]),
+                "seed:demo",
+                "seed:hardcoded",
+            )
+
+    return SeedMemoriesResponse(
+        user_id=payload.user_id,
+        deleted_existing=int(deleted or 0),
+        inserted=len(rows),
     )
