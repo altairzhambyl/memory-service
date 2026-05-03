@@ -46,8 +46,16 @@ from app.api.schemas import (
 )
 from app.config import get_settings
 from app.db.pool import get_pool
-from app.embeddings.openai import embed_documents, embed_query, get_client
+from app.embeddings.openai import (
+    embed_documents,
+    embed_query,
+    get_client,
+    inject_embed_failure,
+)
 from app.extraction import extract_memories_from_turn
+from app.obs.logging import get_logger
+
+log = get_logger(__name__)
 
 # §3 §10: 1 token ≈ 4 chars for English text. Fine for /recall budget
 # triage; we do NOT need a real tokenizer here, the eval timeout
@@ -202,7 +210,16 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
          never sees a half-written row.
     """
     texts = [doc.text for doc in payload.documents]
-    vectors = await embed_documents(texts)   # list[list[float]] (N, 1536)
+    vectors, embed_error = await embed_documents(texts)
+    if embed_error is not None:
+        # Legacy /ingest is a write path; we cannot store half-state.
+        # Surface a retryable upstream-failure to the caller.
+        raise HTTPException(status_code=503, detail={
+            "error": "upstream_unavailable",
+            "stage": "embed",
+            "reason": embed_error,
+            "retryable": True,
+        })
     settings = get_settings()
 
     pool = get_pool()
@@ -241,7 +258,11 @@ async def query(payload: QueryRequest) -> QueryResponse:
     `<=>` is pgvector's cosine DISTANCE operator, so similarity = 1 - distance.
     Lower distance = higher similarity. The HNSW index makes this O(log N).
     """
-    qvec = await embed_query(payload.query)
+    qvec, embed_error = await embed_query(payload.query)
+    if embed_error is not None:
+        # Cold semantics: read-only path, transient blip → empty hits, never 5xx.
+        log.warning("query.embed_failed", reason=embed_error)
+        return QueryResponse(hits=[])
 
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -450,7 +471,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
     # max_retries=0 on the hot path: 3 retry windows × 30s would blow the
     # §3 60s /turns budget on a 429 burst. /ingest and /recall keep the
     # client default (2) since they don't have the same budget pressure.
-    vectors = await embed_documents(contents, max_retries=0)
+    vectors, embed_error = await embed_documents(contents, max_retries=0)
 
     # Anonymous turns can't write memories (table requires user_id NOT NULL),
     # so skip the LLM call entirely — saves cost and avoids a no-op write path.
@@ -460,9 +481,34 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
     else:
         extracted, extraction_error = await extract_memories_from_turn(payload.messages)
 
+    # §5 / HGT-24 graceful upstream-failure policy:
+    #   * both ok           → full commit (today's path).
+    #   * embed fails       → commit turn metadata + memories; no
+    #                         turn_messages / documents / embeddings rows
+    #                         for this turn. The turn won't surface in
+    #                         `## Relevant from recent conversations`
+    #                         until re-indexed, but `## Known facts` and
+    #                         /users/{id}/memories still work.
+    #   * extract fails     → today's existing path: empty memories,
+    #                         extraction_error in metadata. Already correct.
+    #   * both fail         → 503 retryable. We have neither vectors nor
+    #                         memories — there is nothing useful to commit.
+    if embed_error is not None and not extracted:
+        # "Both fail" = embed failed AND we have no extracted memories
+        # (either because user_id is null, or because extraction errored,
+        # or because the LLM legitimately produced nothing). 503 retryable.
+        raise HTTPException(status_code=503, detail={
+            "error": "upstream_unavailable",
+            "embed_error": embed_error,
+            "extract_error": extraction_error,
+            "retryable": True,
+        })
+
     turn_metadata = dict(payload.metadata)
     if extraction_error:
         turn_metadata["extraction_error"] = extraction_error
+    if embed_error:
+        turn_metadata["embed_error"] = embed_error
 
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
@@ -477,39 +523,46 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             payload.timestamp,
             _to_jsonb(turn_metadata),
         )
-        for idx, (msg, vec) in enumerate(zip(payload.messages, vectors, strict=True)):
-            await conn.execute(
-                """
-                INSERT INTO turn_messages (turn_id, idx, role, name, content)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                turn_id, idx, msg.role, msg.name, msg.content,
-            )
-            doc_id = f"turn:{turn_id}:{idx}"
-            provenance = {
-                "kind": "turn_message",
-                "turn_id": turn_id,
-                "session_id": payload.session_id,
-                "user_id": payload.user_id,
-                "role": msg.role,
-                "name": msg.name,
-                "idx": idx,
-                "ts": payload.timestamp.isoformat(),
-            }
-            await conn.execute(
-                """
-                INSERT INTO documents (id, text, metadata)
-                VALUES ($1, $2, $3::jsonb)
-                """,
-                doc_id, msg.content, _to_jsonb(provenance),
-            )
-            await conn.execute(
-                """
-                INSERT INTO embeddings (doc_id, embedding, model)
-                VALUES ($1, $2, $3)
-                """,
-                doc_id, vec, settings.embedding_model,
-            )
+        if embed_error is None:
+            # Only write the indexed-conversation triplet when we have
+            # vectors. Without embeddings, turn_messages would be invisible
+            # to /recall anyway, so persisting them costs storage with no
+            # retrieval payoff. A future backfill path can re-ingest.
+            for idx, (msg, vec) in enumerate(
+                zip(payload.messages, vectors, strict=True)
+            ):
+                await conn.execute(
+                    """
+                    INSERT INTO turn_messages (turn_id, idx, role, name, content)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    turn_id, idx, msg.role, msg.name, msg.content,
+                )
+                doc_id = f"turn:{turn_id}:{idx}"
+                provenance = {
+                    "kind": "turn_message",
+                    "turn_id": turn_id,
+                    "session_id": payload.session_id,
+                    "user_id": payload.user_id,
+                    "role": msg.role,
+                    "name": msg.name,
+                    "idx": idx,
+                    "ts": payload.timestamp.isoformat(),
+                }
+                await conn.execute(
+                    """
+                    INSERT INTO documents (id, text, metadata)
+                    VALUES ($1, $2, $3::jsonb)
+                    """,
+                    doc_id, msg.content, _to_jsonb(provenance),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO embeddings (doc_id, embedding, model)
+                    VALUES ($1, $2, $3)
+                    """,
+                    doc_id, vec, settings.embedding_model,
+                )
 
         for mem in extracted:
             # §4.1 supersession on (user_id, key). Three cases:
@@ -780,17 +833,33 @@ async def recall(payload: RecallRequest) -> RecallResponse:
 
     §3 cold semantics: empty store, unknown user, or zero matches → 200
     with `{"context": "", "citations": []}`. Never errors.
+
+    §5 / HGT-24 graceful upstream-failure policy: if `embed_query`
+    fails (transient OpenAI blip), the `## Known facts` block STILL
+    renders — it's a direct Postgres read, no embedding required.
+    Only the conversation block goes cold (no docs to rank), so
+    citations will be empty. The eval still gets the user's stable
+    facts; throwing them away on a network blip would be gratuitous.
     """
     if payload.user_id is None:
         # No scope = no recall. We share across same-user sessions (§5),
         # but anonymous queries don't get to fish in everyone's data.
         return RecallResponse(context="", citations=[])
 
-    qvec = await embed_query(payload.query)
-    memories, hits = await asyncio.gather(
-        _fetch_active_memories(payload.user_id),
-        _recall_candidates(payload.query, qvec, payload.user_id, payload.session_id, _RECALL_TOPK),
-    )
+    # Always fetch facts — they don't need the query embedding.
+    memories = await _fetch_active_memories(payload.user_id)
+
+    qvec, embed_error = await embed_query(payload.query)
+    if embed_error is not None:
+        log.warning(
+            "recall.embed_failed", user_id=payload.user_id, reason=embed_error,
+        )
+        hits: list[dict] = []
+    else:
+        hits = await _recall_candidates(
+            payload.query, qvec, payload.user_id, payload.session_id, _RECALL_TOPK,
+        )
+
     context, citations = _format_recall_context(memories, hits, payload.max_tokens)
     return RecallResponse(
         context=context,
@@ -809,7 +878,11 @@ async def search(payload: SearchRequest) -> SearchResponse:
         # Same fishing-trip guard as /recall: refuse fully unscoped queries.
         return SearchResponse(results=[])
 
-    qvec = await embed_query(payload.query)
+    qvec, embed_error = await embed_query(payload.query)
+    if embed_error is not None:
+        # /search has no facts-block fallback — return cold per §5/HGT-24.
+        log.warning("search.embed_failed", reason=embed_error)
+        return SearchResponse(results=[])
     # session_id-only scope falls back to user-less lookup; we narrow by
     # session_id in SQL when user_id is missing.
     where = ["d.metadata->>'kind' = 'turn_message'"]
@@ -969,18 +1042,19 @@ async def admin_turn_index(
         where.append(f"metadata->>'session_id' = ${len(args)}")
     where_sql = " AND ".join(where)
 
-    # Build a parallel turns-side WHERE for the extraction-failure count.
+    # Build parallel turns-side WHERE clauses for the failure counts.
     # `documents` rows live under metadata->>'kind' = 'turn_message' but
-    # extraction errors live in turns.metadata, so we have to scope twice.
-    turn_args: list[object] = []
-    turn_where = ["metadata ? 'extraction_error'"]
+    # error markers live in turns.metadata, so we have to scope twice.
+    turn_scope_args: list[object] = []
+    turn_scope: list[str] = []
     if user_id is not None:
-        turn_args.append(user_id)
-        turn_where.append(f"user_id = ${len(turn_args)}")
+        turn_scope_args.append(user_id)
+        turn_scope.append(f"user_id = ${len(turn_scope_args)}")
     if session_id is not None:
-        turn_args.append(session_id)
-        turn_where.append(f"session_id = ${len(turn_args)}")
-    turn_where_sql = " AND ".join(turn_where)
+        turn_scope_args.append(session_id)
+        turn_scope.append(f"session_id = ${len(turn_scope_args)}")
+    extract_where = " AND ".join(["metadata ? 'extraction_error'", *turn_scope])
+    embed_where = " AND ".join(["metadata ? 'embed_error'", *turn_scope])
 
     async with pool.acquire() as conn:
         docs_count = await conn.fetchval(
@@ -997,8 +1071,12 @@ async def admin_turn_index(
             *args,
         )
         extraction_failures = await conn.fetchval(
-            f"SELECT count(*) FROM turns WHERE {turn_where_sql}",
-            *turn_args,
+            f"SELECT count(*) FROM turns WHERE {extract_where}",
+            *turn_scope_args,
+        )
+        embed_failures = await conn.fetchval(
+            f"SELECT count(*) FROM turns WHERE {embed_where}",
+            *turn_scope_args,
         )
         rows = await conn.fetch(
             f"""
@@ -1019,6 +1097,7 @@ async def admin_turn_index(
         documents_count=int(docs_count or 0),
         embeddings_count=int(embs_count or 0),
         extraction_failures=int(extraction_failures or 0),
+        embed_failures=int(embed_failures or 0),
         rows=[
             TurnIndexRow(
                 doc_id=r["id"],
@@ -1052,6 +1131,22 @@ def _parse_iso_z(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+@router.post("/admin/inject_embed_failure")
+async def admin_inject_embed_failure(
+    count: int = Query(default=1, ge=0, le=100),
+    error: str = Query(default="connection"),
+) -> dict:
+    """
+    Test-only knob: load a counter that forces the next N embed_documents
+    calls to return `([], error)` instead of hitting OpenAI. The DB is not
+    exposed to the host, so HGT-24 graceful-degradation tests can't
+    monkey-patch in-process; this endpoint lets them inject the failure
+    via the live HTTP stack instead. NOT part of the §3 contract.
+    """
+    inject_embed_failure(count, error)
+    return {"queued_failures": count, "error_tag": error}
+
+
 @router.post("/admin/run_fixture", response_model=RunFixtureResponse)
 async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
     """
@@ -1080,7 +1175,12 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
 
     # 2. Ingest each turn via the real create_turn so the production
     #    embed+index path runs. Capture turn_id by label for verdict mapping.
+    # §5/HGT-24: a transient OpenAI blip on one turn must not abort the
+    # whole fixture. Wrap each ingest; bucket failures into the aggregate
+    # so the operator can see the gap without parsing logs.
     label_to_turn_id: dict[str, str] = {}
+    ingest_failures = 0
+    ingest_error_modes: dict[str, int] = {}
     for conv in fixture["conversations"]:
         for turn in conv["turns"]:
             req = TurnRequest(
@@ -1090,7 +1190,31 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
                 timestamp=_parse_iso_z(turn["timestamp"]),
                 metadata={"fixture": payload.name, "turn_label": turn["label"]},
             )
-            resp = await create_turn(req)
+            try:
+                resp = await create_turn(req)
+            except HTTPException as exc:
+                ingest_failures += 1
+                tag = "http_503" if exc.status_code == 503 else f"http_{exc.status_code}"
+                ingest_error_modes[tag] = ingest_error_modes.get(tag, 0) + 1
+                log.warning(
+                    "fixture.ingest_failed",
+                    fixture=payload.name,
+                    turn_label=turn["label"],
+                    status=exc.status_code,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — last-resort net per §5
+                ingest_failures += 1
+                tag = f"unhandled:{type(exc).__name__}"
+                ingest_error_modes[tag] = ingest_error_modes.get(tag, 0) + 1
+                log.warning(
+                    "fixture.ingest_unhandled",
+                    fixture=payload.name,
+                    turn_label=turn["label"],
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:200],
+                )
+                continue
             label_to_turn_id[turn["label"]] = resp.id
 
     turn_id_to_label = {v: k for k, v in label_to_turn_id.items()}
@@ -1204,6 +1328,8 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
             if positive_top_scores else 0.0,
         extraction_failures=extraction_failures,
         extraction_error_modes=extraction_error_modes,
+        ingest_failures=ingest_failures,
+        ingest_error_modes=ingest_error_modes,
     )
     return RunFixtureResponse(
         aggregate=aggregate,

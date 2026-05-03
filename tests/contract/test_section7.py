@@ -60,6 +60,21 @@ def _post_turn(session_id: str, user_id: str | None, content: str) -> str:
     return r.json()["id"]
 
 
+def _inject_embed_failure(count: int, error: str = "connection") -> None:
+    """Test-only: load N forced embed failures into the running app."""
+    r = httpx.post(
+        f"{BASE}/admin/inject_embed_failure",
+        params={"count": count, "error": error},
+        timeout=5,
+    )
+    assert r.status_code == 200, r.text
+
+
+def _clear_injected_failures() -> None:
+    """Reset the injection counter so other tests aren't polluted."""
+    _inject_embed_failure(0)
+
+
 def test_synchronous_availability():
     """§5: after POST /turns returns, the extracted memory MUST be
     queryable via /users/{id}/memories AND /recall in the next call.
@@ -231,3 +246,178 @@ def test_restart_persistence():
         assert after == before, f"data drift across restart: before={before} after={after}"
     finally:
         httpx.delete(f"{BASE}/users/{uid}", timeout=10)
+
+
+# =====================================================================
+# HGT-24 — graceful upstream-failure handling. Tests use the
+# /admin/inject_embed_failure knob to simulate transient OpenAI blips
+# without monkey-patching (DB is not exposed to the host so in-process
+# tests aren't an option).
+# =====================================================================
+
+
+def test_turns_survives_embed_blip():
+    """§5: a transient embed failure must NOT 500 /turns when extraction
+    can still produce memories. Turn metadata records the failure.
+    """
+    sid = _unique("sess-eb")
+    uid = _unique("user-eb")
+    try:
+        _inject_embed_failure(1)
+        r = httpx.post(
+            f"{BASE}/turns",
+            json={
+                "session_id": sid,
+                "user_id": uid,
+                "messages": [
+                    {"role": "user", "content": "I work at Notion as a PM in Berlin."},
+                    {"role": "assistant", "content": "Got it."},
+                ],
+                "timestamp": "2026-05-03T10:00:00Z",
+                "metadata": {},
+            },
+            timeout=60,
+        )
+        assert r.status_code == 201, r.text
+
+        # Memories from the LLM extractor (real call, not faked) survive.
+        mem = httpx.get(f"{BASE}/users/{uid}/memories", timeout=10).json()
+        assert mem["memories"], f"extractor produced no memories: {mem}"
+
+        # /admin/turn_index reflects the embed failure.
+        idx = httpx.get(
+            f"{BASE}/admin/turn_index",
+            params={"user_id": uid, "session_id": sid, "limit": 5},
+            timeout=10,
+        ).json()
+        assert idx["embed_failures"] >= 1, idx
+        # No turn_message documents were indexed for this turn.
+        assert idx["documents_count"] == 0, idx
+    finally:
+        _clear_injected_failures()
+        httpx.delete(f"{BASE}/users/{uid}", timeout=10)
+
+
+def test_recall_returns_facts_when_embed_fails():
+    """§5/§HGT-24: `## Known facts` block must still render when
+    embed_query fails — facts come straight from Postgres, no embedding
+    needed. Only the conversation block goes cold.
+    """
+    sid = _unique("sess-rf")
+    uid = _unique("user-rf")
+    try:
+        # Seed real memories first (no failure injected).
+        _post_turn(sid, uid, "I live in Paris and work as a data scientist.")
+
+        # Now force the next embed call to fail.
+        _inject_embed_failure(1)
+        rec = httpx.post(
+            f"{BASE}/recall",
+            json={
+                "query": "where does this user live",
+                "session_id": _unique("recall-rf"),
+                "user_id": uid,
+                "max_tokens": 1024,
+            },
+            timeout=30,
+        )
+        assert rec.status_code == 200, rec.text
+        body = rec.json()
+        assert "## Known facts about this user" in body["context"], body
+        assert body["citations"] == [], body
+    finally:
+        _clear_injected_failures()
+        httpx.delete(f"{BASE}/users/{uid}", timeout=10)
+
+
+def test_recall_fully_cold_when_no_memories_and_embed_fails():
+    """§3 cold semantics + HGT-24: unknown user with no memories AND
+    embed_query failing → 200 with fully empty body, never 500.
+    """
+    uid = _unique("ghost")
+    try:
+        _inject_embed_failure(1)
+        rec = httpx.post(
+            f"{BASE}/recall",
+            json={
+                "query": "anything",
+                "session_id": _unique("recall-cold"),
+                "user_id": uid,
+                "max_tokens": 1024,
+            },
+            timeout=30,
+        )
+        assert rec.status_code == 200, rec.text
+        assert rec.json() == {"context": "", "citations": []}
+    finally:
+        _clear_injected_failures()
+
+
+def test_fixture_runner_aggregates_failures():
+    """§5/§HGT-24: a transient embed blip on one turn must NOT abort
+    the whole fixture run. With graceful /turns the blipped turn
+    returns 201 with `embed_error` in metadata (no 503), so the
+    aggregate's `ingest_failures` correctly stays at 0; the failure is
+    observable via `embed_failures` on /admin/turn_index for the
+    fixture users.
+    """
+    try:
+        _inject_embed_failure(1)
+        r = httpx.post(
+            f"{BASE}/admin/run_fixture",
+            json={"name": "v1"},
+            timeout=180,
+        )
+        assert r.status_code == 200, r.text
+        agg = r.json()["aggregate"]
+        # Fixture completed end-to-end despite the injection.
+        assert agg["positive_total"] >= 1, agg
+        assert agg["ingest_failures"] == 0, agg
+
+        # Failure is observable on /admin/turn_index for one of the fixture users.
+        # We don't know which user got hit (depends on fixture iteration order),
+        # so sum the embed_failures across all fix-* users in v1.
+        total_embed_failures = 0
+        for uid in ("fix-berlin", "fix-pet", "fix-diet"):
+            idx = httpx.get(
+                f"{BASE}/admin/turn_index",
+                params={"user_id": uid, "limit": 1},
+                timeout=10,
+            ).json()
+            total_embed_failures += idx["embed_failures"]
+        assert total_embed_failures >= 1, f"no embed_error markers found, expected ≥1"
+    finally:
+        _clear_injected_failures()
+
+
+def test_both_embed_and_extract_fail_returns_503():
+    """§5/§HGT-24: when neither embed nor extract has anything to
+    persist, /turns returns 503 retryable. Anonymous turn skips
+    extraction entirely, so injecting an embed failure leaves us with
+    zero useful state — the canonical "both fail" condition.
+    """
+    sid = _unique("sess-503")
+    try:
+        _inject_embed_failure(1)
+        r = httpx.post(
+            f"{BASE}/turns",
+            json={
+                "session_id": sid,
+                "user_id": None,  # extraction skipped
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ],
+                "timestamp": "2026-05-03T10:00:00Z",
+                "metadata": {},
+            },
+            timeout=30,
+        )
+        assert r.status_code == 503, r.text
+        body = r.json()
+        # FastAPI wraps the dict detail under a "detail" key.
+        detail = body.get("detail", body)
+        assert detail.get("retryable") is True, body
+        assert detail.get("error") == "upstream_unavailable", body
+    finally:
+        _clear_injected_failures()

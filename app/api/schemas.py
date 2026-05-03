@@ -198,6 +198,7 @@ class TurnIndexResponse(BaseModel):
     documents_count: int
     embeddings_count: int
     extraction_failures: int
+    embed_failures: int = 0
     rows: list[TurnIndexRow]
 
 
@@ -241,6 +242,8 @@ class FixtureAggregate(BaseModel):
     mean_top_score: float
     extraction_failures: int = 0
     extraction_error_modes: dict[str, int] = Field(default_factory=dict)
+    ingest_failures: int = 0
+    ingest_error_modes: dict[str, int] = Field(default_factory=dict)
 
 
 class RunFixtureResponse(BaseModel):
