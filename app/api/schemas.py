@@ -197,6 +197,7 @@ class TurnIndexRow(BaseModel):
 class TurnIndexResponse(BaseModel):
     documents_count: int
     embeddings_count: int
+    extraction_failures: int
     rows: list[TurnIndexRow]
 
 
@@ -238,6 +239,8 @@ class FixtureAggregate(BaseModel):
     recall_at_3: float
     noise_resistance: float
     mean_top_score: float
+    extraction_failures: int = 0
+    extraction_error_modes: dict[str, int] = Field(default_factory=dict)
 
 
 class RunFixtureResponse(BaseModel):
@@ -246,18 +249,3 @@ class RunFixtureResponse(BaseModel):
     elapsed_ms: int
 
 
-# ---------- Admin: POST /admin/seed_memories ----------
-# Demo-grade seeder that writes the "ideal extraction" rows for the
-# v1 fixture users (fix-berlin / fix-pet / fix-diet). HGT-17a-ii will
-# replace this with a real LLM extractor in POST /turns; this seeder
-# is here so the read path + UI can be exercised before the LLM
-# pipeline lands.
-
-class SeedMemoriesRequest(BaseModel):
-    user_id: str = Field(min_length=1)
-
-
-class SeedMemoriesResponse(BaseModel):
-    user_id: str
-    deleted_existing: int
-    inserted: int

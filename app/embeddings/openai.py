@@ -28,18 +28,44 @@ _client: AsyncOpenAI | None = None
 
 
 def get_client() -> AsyncOpenAI:
+    """
+    Process-singleton AsyncOpenAI. Explicit `timeout=30` because the SDK
+    default is 600s (per https://github.com/openai/openai-python/issues/762),
+    which is far above our §3 60s /turns budget. `max_retries=2` lets the
+    SDK transparently retry transient 429/503 with exponential backoff so
+    the application code only sees terminal failures.
+    """
     global _client
     if _client is None:
         settings = get_settings()
-        _client = AsyncOpenAI(api_key=settings.openai_api_key)
+        _client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            timeout=30.0,
+            max_retries=2,
+        )
         log.info("openai.client.ready", model=settings.embedding_model)
     return _client
 
 
-async def embed_documents(texts: list[str]) -> list[list[float]]:
-    """Embed N texts in one API call. Returns N lists of 1536 floats."""
+async def embed_documents(
+    texts: list[str],
+    *,
+    max_retries: int | None = None,
+) -> list[list[float]]:
+    """
+    Embed N texts in one API call. Returns N lists of 1536 floats.
+
+    `max_retries` overrides the client default (2). Hot paths inside
+    POST /turns must pass `max_retries=0` because the §3 60s budget
+    can't accommodate three sequential 30s retry windows on a 429
+    or transient 5xx — see openai-python issue #762 for the default
+    timeout reasoning. Best-effort callers (/ingest, /recall) keep
+    the default so transient blips don't bubble up.
+    """
     settings = get_settings()
     client = get_client()
+    if max_retries is not None:
+        client = client.with_options(max_retries=max_retries)
     resp = await client.embeddings.create(
         model=settings.embedding_model,
         input=texts,
@@ -47,7 +73,7 @@ async def embed_documents(texts: list[str]) -> list[list[float]]:
     return [item.embedding for item in resp.data]
 
 
-async def embed_query(query: str) -> list[float]:
+async def embed_query(query: str, *, max_retries: int | None = None) -> list[float]:
     """Embed a single query string. Returns 1536 floats."""
-    vecs = await embed_documents([query])
+    vecs = await embed_documents([query], max_retries=max_retries)
     return vecs[0]

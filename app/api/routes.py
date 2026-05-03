@@ -35,8 +35,6 @@ from app.api.schemas import (
     SearchHit,
     SearchRequest,
     SearchResponse,
-    SeedMemoriesRequest,
-    SeedMemoriesResponse,
     TurnIndexResponse,
     TurnIndexRow,
     TurnMessage,
@@ -48,6 +46,7 @@ from app.api.schemas import (
 from app.config import get_settings
 from app.db.pool import get_pool
 from app.embeddings.openai import embed_documents, embed_query, get_client
+from app.extraction import extract_memories_from_turn
 
 # §3 §10: 1 token ≈ 4 chars for English text. Fine for /recall budget
 # triage; we do NOT need a real tokenizer here, the eval timeout
@@ -410,25 +409,50 @@ async def delete_chat_history(
 
 # =====================================================================
 # §3 contract endpoints. These are the eval-facing surface.
-# HGT-15 ships only the shapes + synchronous /turns persistence;
-# HGT-16/17 fill in recall, search, and structured memories.
+# Embedding, retrieval, and LLM extraction are live as of HGT-17a-ii;
+# §4.1 supersession (HGT-18) and §4.3 priority assembly with a
+# "## Known facts" section in /recall (HGT-19) are the next slices.
 # =====================================================================
 
 
 @router.post("/turns", response_model=TurnResponse, status_code=201)
 async def create_turn(payload: TurnRequest) -> TurnResponse:
     """
-    Persist a turn + its messages synchronously, then index each message
-    into documents/embeddings under doc_id `turn:{turn_id}:{idx}`. The
-    embed call happens before the DB transaction so a network blip won't
-    leave half-written rows; once we open the transaction, all writes
-    commit or roll back together (§5 synchronous correctness).
+    Persist a turn + its messages synchronously, index each message into
+    documents/embeddings under doc_id `turn:{turn_id}:{idx}`, and run the
+    LLM extractor to populate typed `memories` rows.
+
+    Both the embed batch and the extractor run BEFORE `pool.acquire()` so
+    we never hold a Postgres connection during an OpenAI HTTP roundtrip
+    (the pool is small — see app/db/pool.py — and a 1-3s extractor would
+    saturate it under concurrency). Once the transaction opens, all DB
+    writes commit or roll back together (§5 synchronous correctness).
+
+    Extraction failure is graceful per §5: the error string is recorded
+    in `turns.metadata.extraction_error` and the turn is still committed
+    with zero memories. AuthenticationError is the only exception that
+    propagates — it indicates a config bug, not transient runtime state.
     """
     turn_id = str(uuid.uuid4())
     settings = get_settings()
 
     contents = [msg.content for msg in payload.messages]
-    vectors = await embed_documents(contents)
+    # max_retries=0 on the hot path: 3 retry windows × 30s would blow the
+    # §3 60s /turns budget on a 429 burst. /ingest and /recall keep the
+    # client default (2) since they don't have the same budget pressure.
+    vectors = await embed_documents(contents, max_retries=0)
+
+    # Anonymous turns can't write memories (table requires user_id NOT NULL),
+    # so skip the LLM call entirely — saves cost and avoids a no-op write path.
+    if payload.user_id is None:
+        extracted: list[dict] = []
+        extraction_error: str | None = None
+    else:
+        extracted, extraction_error = await extract_memories_from_turn(payload.messages)
+
+    turn_metadata = dict(payload.metadata)
+    if extraction_error:
+        turn_metadata["extraction_error"] = extraction_error
 
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
@@ -441,7 +465,7 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
             payload.session_id,
             payload.user_id,
             payload.timestamp,
-            _to_jsonb(payload.metadata),
+            _to_jsonb(turn_metadata),
         )
         for idx, (msg, vec) in enumerate(zip(payload.messages, vectors, strict=True)):
             await conn.execute(
@@ -475,6 +499,25 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
                 VALUES ($1, $2, $3)
                 """,
                 doc_id, vec, settings.embedding_model,
+            )
+
+        for mem in extracted:
+            await conn.execute(
+                """
+                INSERT INTO memories (
+                    id, user_id, type, key, value, confidence,
+                    source_session, source_turn, supersedes, active
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, TRUE)
+                """,
+                str(uuid.uuid4()),
+                payload.user_id,
+                mem["type"],
+                mem["key"],
+                mem["value"],
+                float(mem["confidence"]),
+                payload.session_id,
+                turn_id,
             )
     return TurnResponse(id=turn_id)
 
@@ -746,7 +789,13 @@ async def admin_turn_index(
     session_id: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
 ) -> TurnIndexResponse:
-    """Show indexed turn-message rows so the UI can verify HGT-16a writes."""
+    """
+    Inspector for the /turns indexing path: indexed-message counts +
+    recent rows + per-scope extraction-failure count (turns whose
+    metadata carries an `extraction_error` from HGT-17a-ii). The UI
+    pulls this on every refresh so writes and failures are visible
+    without psql.
+    """
     pool = get_pool()
     where = ["metadata->>'kind' = 'turn_message'"]
     args: list[object] = []
@@ -757,6 +806,19 @@ async def admin_turn_index(
         args.append(session_id)
         where.append(f"metadata->>'session_id' = ${len(args)}")
     where_sql = " AND ".join(where)
+
+    # Build a parallel turns-side WHERE for the extraction-failure count.
+    # `documents` rows live under metadata->>'kind' = 'turn_message' but
+    # extraction errors live in turns.metadata, so we have to scope twice.
+    turn_args: list[object] = []
+    turn_where = ["metadata ? 'extraction_error'"]
+    if user_id is not None:
+        turn_args.append(user_id)
+        turn_where.append(f"user_id = ${len(turn_args)}")
+    if session_id is not None:
+        turn_args.append(session_id)
+        turn_where.append(f"session_id = ${len(turn_args)}")
+    turn_where_sql = " AND ".join(turn_where)
 
     async with pool.acquire() as conn:
         docs_count = await conn.fetchval(
@@ -771,6 +833,10 @@ async def admin_turn_index(
             WHERE  {where_sql}
             """,
             *args,
+        )
+        extraction_failures = await conn.fetchval(
+            f"SELECT count(*) FROM turns WHERE {turn_where_sql}",
+            *turn_args,
         )
         rows = await conn.fetch(
             f"""
@@ -790,6 +856,7 @@ async def admin_turn_index(
     return TurnIndexResponse(
         documents_count=int(docs_count or 0),
         embeddings_count=int(embs_count or 0),
+        extraction_failures=int(extraction_failures or 0),
         rows=[
             TurnIndexRow(
                 doc_id=r["id"],
@@ -939,6 +1006,26 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
             notes=f"expected={expected_label} got={top_label}",
         ))
 
+    # Surface extraction failures from the just-ingested fixture turns so
+    # one Run-fixture click answers two questions: did /recall find the
+    # turn, and did the extractor actually populate memories for it.
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT metadata->>'extraction_error' AS error
+            FROM   turns
+            WHERE  user_id = ANY($1::text[])
+              AND  metadata ? 'extraction_error'
+            """,
+            user_ids,
+        )
+    extraction_failures = len(rows)
+    extraction_error_modes: dict[str, int] = {}
+    for r in rows:
+        bucket = r["error"] or "unknown"
+        extraction_error_modes[bucket] = extraction_error_modes.get(bucket, 0) + 1
+
     elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
     aggregate = FixtureAggregate(
         name=payload.name,
@@ -953,6 +1040,8 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         noise_resistance=(noise_passed / noise_total) if noise_total else 0.0,
         mean_top_score=(sum(positive_top_scores) / len(positive_top_scores))
             if positive_top_scores else 0.0,
+        extraction_failures=extraction_failures,
+        extraction_error_modes=extraction_error_modes,
     )
     return RunFixtureResponse(
         aggregate=aggregate,
@@ -961,75 +1050,3 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
     )
 
 
-# =====================================================================
-# Demo seeder for HGT-17a-i. Writes the "ideal extraction" rows for the
-# v1 fixture users so the GET /users/{user_id}/memories read path + UI
-# table can be exercised before the real LLM extractor lands in
-# HGT-17a-ii. Each call wipes the user's existing memories first so
-# re-runs are idempotent. Restricted to known fix-* user_ids — we don't
-# pretend to have ground-truth extractions for arbitrary users.
-# =====================================================================
-
-
-_SEED_MEMORIES: dict[str, list[dict[str, object]]] = {
-    "fix-berlin": [
-        {"type": "fact",       "key": "location.city",             "value": "Berlin",            "confidence": 0.95},
-        {"type": "fact",       "key": "location.previous_city",    "value": "NYC",               "confidence": 0.90},
-        {"type": "fact",       "key": "employment.company",        "value": "Notion",            "confidence": 0.95},
-        {"type": "fact",       "key": "employment.role",           "value": "Product Manager",   "confidence": 0.90},
-        {"type": "fact",       "key": "employment.previous_company","value": "Stripe",           "confidence": 0.90},
-    ],
-    "fix-pet": [
-        {"type": "fact",       "key": "pet.name",                  "value": "Biscuit",           "confidence": 0.95},
-        {"type": "fact",       "key": "pet.species",               "value": "beagle",            "confidence": 0.95},
-        {"type": "fact",       "key": "pet.age_years",             "value": "3",                 "confidence": 0.85},
-    ],
-    "fix-diet": [
-        {"type": "preference", "key": "diet.style",                "value": "vegetarian",        "confidence": 0.95},
-        {"type": "fact",       "key": "allergy",                   "value": "shellfish",         "confidence": 0.95},
-        {"type": "preference", "key": "beverage.coffee",           "value": "no",                "confidence": 0.85},
-    ],
-}
-
-
-@router.post("/admin/seed_memories", response_model=SeedMemoriesResponse)
-async def admin_seed_memories(payload: SeedMemoriesRequest) -> SeedMemoriesResponse:
-    """Demo-grade seeder so the §3 inspection endpoint has something to show."""
-    if payload.user_id not in _SEED_MEMORIES:
-        raise HTTPException(
-            status_code=404,
-            detail=f"no_seed_template_for:{payload.user_id} (known: {sorted(_SEED_MEMORIES)})",
-        )
-
-    rows = _SEED_MEMORIES[payload.user_id]
-    pool = get_pool()
-    async with pool.acquire() as conn, conn.transaction():
-        deleted = await conn.fetchval(
-            "WITH d AS (DELETE FROM memories WHERE user_id = $1 RETURNING 1) SELECT count(*) FROM d",
-            payload.user_id,
-        )
-        for row in rows:
-            await conn.execute(
-                """
-                INSERT INTO memories (
-                    id, user_id, type, key, value, confidence,
-                    source_session, source_turn,
-                    supersedes, active
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, TRUE)
-                """,
-                str(uuid.uuid4()),
-                payload.user_id,
-                row["type"],
-                row["key"],
-                row["value"],
-                float(row["confidence"]),
-                "seed:demo",
-                "seed:hardcoded",
-            )
-
-    return SeedMemoriesResponse(
-        user_id=payload.user_id,
-        deleted_existing=int(deleted or 0),
-        inserted=len(rows),
-    )
