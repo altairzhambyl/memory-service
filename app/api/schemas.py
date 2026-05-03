@@ -244,3 +244,20 @@ class RunFixtureResponse(BaseModel):
     aggregate: FixtureAggregate
     probes: list[FixtureProbeResult]
     elapsed_ms: int
+
+
+# ---------- Admin: POST /admin/seed_memories ----------
+# Demo-grade seeder that writes the "ideal extraction" rows for the
+# v1 fixture users (fix-berlin / fix-pet / fix-diet). MS-17a-ii will
+# replace this with a real LLM extractor in POST /turns; this seeder
+# is here so the read path + UI can be exercised before the LLM
+# pipeline lands.
+
+class SeedMemoriesRequest(BaseModel):
+    user_id: str = Field(min_length=1)
+
+
+class SeedMemoriesResponse(BaseModel):
+    user_id: str
+    deleted_existing: int
+    inserted: int

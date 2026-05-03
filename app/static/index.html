@@ -717,6 +717,25 @@
             <p class="s3-empty">Click "Run fixture" — destructive on <code>fix-*</code> users only.</p>
           </div>
         </article>
+
+        <article class="s3-card">
+          <h2>6. GET /users/{user_id}/memories — typed structured rows</h2>
+          <p class="desc">Reads the inspection endpoint. Until MS-17a-ii lands the real LLM extractor, the "Seed demo memories" button writes the ideal-extraction rows for <code>fix-berlin</code>, <code>fix-pet</code>, <code>fix-diet</code>. DELETE /users wipes these too.</p>
+          <div class="s3-row">
+            <input id="s3MemUser" placeholder="user_id" value="fix-berlin">
+          </div>
+          <div class="s3-actions">
+            <button class="s3-action" id="s3RefreshMemBtn" type="button">Refresh memories</button>
+            <button class="s3-action ghost" id="s3SeedMemBtn" type="button">Seed demo memories</button>
+          </div>
+          <div class="s3-counts" id="s3MemCounts">
+            <span class="s3-pill">rows: <strong>—</strong></span>
+            <span class="s3-pill">types: <strong>—</strong></span>
+          </div>
+          <div id="s3MemTableWrap">
+            <p class="s3-empty">Click refresh.</p>
+          </div>
+        </article>
       </section>
 
       <form class="composer" id="composer">
@@ -1105,6 +1124,11 @@
       runFixtureBtn: document.querySelector("#s3RunFixtureBtn"),
       fixtureAggregate: document.querySelector("#s3FixtureAggregate"),
       fixtureTableWrap: document.querySelector("#s3FixtureTableWrap"),
+      memUser: document.querySelector("#s3MemUser"),
+      refreshMemBtn: document.querySelector("#s3RefreshMemBtn"),
+      seedMemBtn: document.querySelector("#s3SeedMemBtn"),
+      memCounts: document.querySelector("#s3MemCounts"),
+      memTableWrap: document.querySelector("#s3MemTableWrap"),
     };
 
     function s3DefaultPayload(userId, sessionId) {
@@ -1361,6 +1385,78 @@
     }
 
     s3.runFixtureBtn.addEventListener("click", s3RunFixture);
+
+    function s3RenderMemories(data) {
+      const rows = data.memories || [];
+      const types = {};
+      for (const m of rows) types[m.type] = (types[m.type] || 0) + 1;
+      const typeStr = Object.keys(types).length
+        ? Object.entries(types).map(([k, v]) => `${k}:${v}`).join(", ")
+        : "—";
+      s3.memCounts.innerHTML =
+        `<span class="s3-pill">rows: <strong>${rows.length}</strong></span>` +
+        `<span class="s3-pill">types: <strong>${escapeHtml(typeStr)}</strong></span>`;
+      if (!rows.length) {
+        s3.memTableWrap.innerHTML = '<p class="s3-empty">No memories for this user yet. Try "Seed demo memories" for a fix-* user.</p>';
+        return;
+      }
+      const rowsHtml = rows.map((m) => `<tr>
+        <td class="mono">${escapeHtml(m.type)}</td>
+        <td class="mono">${escapeHtml(m.key)}</td>
+        <td>${escapeHtml(m.value)}</td>
+        <td>${m.confidence.toFixed(2)}</td>
+        <td>${escapeHtml(m.source_session)}</td>
+        <td class="mono">${escapeHtml(m.source_turn)}</td>
+        <td>${m.active ? "✓" : "✗"}</td>
+        <td>${escapeHtml(m.updated_at)}</td>
+      </tr>`).join("");
+      s3.memTableWrap.innerHTML = `
+        <table class="s3-table">
+          <thead><tr>
+            <th>type</th><th>key</th><th>value</th><th>conf</th><th>session</th><th>turn</th><th>active</th><th>updated_at</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      `;
+    }
+
+    async function s3RefreshMemories() {
+      const u = s3.memUser.value.trim();
+      if (!u) {
+        s3.memCounts.innerHTML = `<span class="s3-pill warn"><strong>user_id required</strong></span>`;
+        return;
+      }
+      s3.refreshMemBtn.disabled = true;
+      try {
+        const data = await requestJson(`/users/${encodeURIComponent(u)}/memories`);
+        s3RenderMemories(data);
+      } catch (err) {
+        s3.memCounts.innerHTML = `<span class="s3-pill warn"><strong>Error: ${escapeHtml(err.message)}</strong></span>`;
+        s3.memTableWrap.innerHTML = "";
+      } finally {
+        s3.refreshMemBtn.disabled = false;
+      }
+    }
+
+    async function s3SeedMemories() {
+      const u = s3.memUser.value.trim();
+      if (!u) return;
+      s3.seedMemBtn.disabled = true;
+      try {
+        await requestJson("/admin/seed_memories", {
+          method: "POST",
+          body: JSON.stringify({ user_id: u }),
+        });
+        await s3RefreshMemories();
+      } catch (err) {
+        s3.memCounts.innerHTML = `<span class="s3-pill warn"><strong>Seed error: ${escapeHtml(err.message)}</strong></span>`;
+      } finally {
+        s3.seedMemBtn.disabled = false;
+      }
+    }
+
+    s3.refreshMemBtn.addEventListener("click", s3RefreshMemories);
+    s3.seedMemBtn.addEventListener("click", s3SeedMemories);
 
     document.querySelector("#composer").addEventListener("submit", (event) => {
       event.preventDefault();
