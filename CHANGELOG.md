@@ -238,3 +238,26 @@ Fix: rewrote `scripts/smoke.sh` под exact §7 reference flow:
 README quickstart теперь pointers reviewer'а на `bash scripts/smoke.sh` после `docker compose up`. Layout rename `app/ → src/` НЕ delivered: CLAUDE.md §13 explicitly says «Our current layout uses `app/` instead of `src/` per Python convention — the brief is permissive on language layout». Rename touches Dockerfile, all imports, tests; pure churn без correctness gain. Документировано в Patch D scope.
 **Verification:** `bash scripts/smoke.sh` end-to-end успешно: 2 typed memories extracted (location.city=Berlin, location.previous_city=NYC, both active=TRUE), DELETE returns 204. Cleanup идемпотентен.
 **Линковка:** HGT-31 → Done. **Codex audit triage 7/7 closed.** Submission contract polishing complete.
+
+2026-05-03
+Submission wrap-up — что сделано / что не сделано — §2, §13, §14
+Сделано:
+* §3 контракт. 7 endpoints, exact shapes + статусы. Persistence через named volume.
+* Извлечение §4.2. gpt-4o-mini Structured Outputs, 8 категорий, graceful на transient OpenAI fail.
+* Хранилище. Postgres + pgvector, 7 миграций, один volume, одна транзакция per /turns.
+* Supersession §4.1. Canonical `slot` map + partial UNIQUE `(user_id, slot) WHERE active=TRUE` + `pg_advisory_xact_lock`. История chain'a в `/users/{id}/memories`.
+* Hybrid retrieval §10. Cosine top-30 + Postgres FTS top-30 + RRF k=60. Не vanilla cosine.
+* Query-aware facts §4.3. Sibling `kind='memory'` docs, hybrid-rank по similarity. Tight budget — irrelevant facts отбрасываются first.
+* Noise gate §9. Block-level relevance + per-hit cosine filter. Off-topic → cold context.
+* Graceful upstream §5. Embed/extract fail → 201 + metadata flag, никогда 5xx на blip. Both fail → 503 retryable.
+* Tests. 19 offline + 23 live = 42 passed. v1 fixture (recall@1=6/6 floor) + v2 fixture (9 probes — multi-hop / kw-anchored / supersession arcs / tight-budget / noise-typed-user, all PASS).
+* CHANGELOG. 13 metric-bearing entries (§10 минимум 4+ перевыполнен).
+* UI. Все §3 endpoints + admin observability + fixture runner с verdict pills.
+
+Не сделано:
+* `app/` → `src/` rename. CLAUDE.md §13 разрешает app/. Pure churn без runtime gain.
+* Async/background re-embed или re-slot. Out of scope §12. /turns остаётся synchronous.
+* LLM-judge canonicalization. Лишняя latency и non-determinism пока deterministic slot map не оказался недостаточным.
+* Per-fact relevance gate. Текущий recall — query-aware ranking + budget ordering. Stricter off-topic fact gate — следующий hardening step, **HGT-32**, потому что noise resistance это named eval category.
+
+Final verification: `RAG_E2E=1 pytest tests/ -q` → 42 passed. v1 + v2 → all probes PASS. Smoke `bash scripts/smoke.sh` → §3 reference flow end-to-end. Submission ready.
