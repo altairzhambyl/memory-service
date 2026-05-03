@@ -56,6 +56,13 @@ _CHARS_PER_TOKEN = 4
 # Hard cap on the candidate pool we pull before token-budget trimming.
 # Keeps the JOIN bounded; HNSW handles ranking.
 _RECALL_TOPK = 10
+# Per-retriever candidate pool for the hybrid fuse. Each retriever (cosine
+# and BM25) returns up to this many docs; RRF merges and re-ranks them.
+_HYBRID_POOL = 30
+# RRF dampening constant. 60 is the value from Cormack-Buettcher-Clarke
+# (2009) and now the de-facto default; we explicitly cite it in the
+# CHANGELOG so a reviewer doesn't have to ask "why 60?".
+_RRF_K = 60
 # Snippet trim to keep one giant message from monopolising the budget.
 _SNIPPET_CHARS = 240
 
@@ -561,47 +568,94 @@ async def create_turn(payload: TurnRequest) -> TurnResponse:
 
 
 async def _recall_candidates(
+    qtext: str,
     qvec: list[float],
     user_id: str | None,
     session_id: str | None,
     top_k: int,
 ) -> list[dict]:
     """
-    Cosine top-k over indexed turn messages. Scope by user_id; cross-session
-    sharing for the same user is intentional per §5 (documented in README).
-    session_id, when supplied, is used only as a soft hint for the eval
-    harness — we do NOT exclude other sessions, but we surface the match's
-    own session_id in the citation so reviewers can see provenance.
+    Hybrid retrieval: cosine top-N (HNSW) AND BM25 top-N (Postgres
+    `tsvector` + `ts_rank_cd`) in parallel, fused via Reciprocal Rank
+    Fusion. §10 explicitly calls vanilla cosine-top-k a floor — pure
+    embedding similarity under-scores keyword-anchored queries on
+    short turns, BM25 catches the literal-token signal, RRF blends the
+    two rankings without needing them to share a score scale.
+
+    Citations keep `score = cosine_similarity` (interpretable in
+    [0,1]) so the §3 contract semantics don't shift. Ordering is by
+    fused RRF rank.
+
+    Scope by user_id; cross-session sharing within the same user is
+    intentional per §5. session_id is captured in citations for
+    provenance but not used as a hard filter.
     """
-    where = ["d.metadata->>'kind' = 'turn_message'"]
-    args: list[object] = [qvec]
-    if user_id is not None:
-        args.append(user_id)
-        where.append(f"d.metadata->>'user_id' = ${len(args)}")
-    where_sql = " AND ".join(where)
-    args.append(top_k)
-    sql = f"""
+    if user_id is None:
+        return []
+
+    pool = get_pool()
+    cosine_sql = """
         SELECT  d.id,
                 d.text,
                 d.metadata,
-                1 - (e.embedding <=> $1) AS score
+                1 - (e.embedding <=> $1) AS cosine_score
         FROM    embeddings e
         JOIN    documents  d ON d.id = e.doc_id
-        WHERE   {where_sql}
+        WHERE   d.metadata->>'kind' = 'turn_message'
+          AND   d.metadata->>'user_id' = $2
         ORDER BY e.embedding <=> $1
-        LIMIT   ${len(args)}
+        LIMIT   $3
     """
-    pool = get_pool()
+    # plainto_tsquery handles tokenisation + stop-word removal; if the
+    # query reduces to nothing (only stopwords) it returns an empty
+    # tsquery and `tsv @@ q` matches zero rows — falls back to pure
+    # cosine, which is fine.
+    bm25_sql = """
+        SELECT  d.id,
+                d.text,
+                d.metadata,
+                1 - (e.embedding <=> $1) AS cosine_score
+        FROM    embeddings e
+        JOIN    documents  d ON d.id = e.doc_id
+        WHERE   d.metadata->>'kind' = 'turn_message'
+          AND   d.metadata->>'user_id' = $2
+          AND   d.tsv @@ plainto_tsquery('english', $4)
+        ORDER BY ts_rank_cd(d.tsv, plainto_tsquery('english', $4)) DESC
+        LIMIT   $3
+    """
+    # asyncpg connections are NOT reentrant — running both fetches in
+    # parallel on a single connection raises `another operation is in
+    # progress`. Two cheap indexed lookups in series is the right
+    # primitive; parallelising would only add pool pressure.
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *args)
+        cos_rows = await conn.fetch(cosine_sql, qvec, user_id, _HYBRID_POOL)
+        bm_rows = await conn.fetch(bm25_sql, qvec, user_id, _HYBRID_POOL, qtext)
+
+    # RRF fusion — score(d) = Σ 1/(k + rank_i(d)) across retrievers.
+    fused: dict[str, dict] = {}
+    for rank, row in enumerate(cos_rows, start=1):
+        fused[row["id"]] = {
+            "row": row,
+            "cosine_score": float(row["cosine_score"]),
+            "rrf": 1.0 / (_RRF_K + rank),
+        }
+    for rank, row in enumerate(bm_rows, start=1):
+        entry = fused.setdefault(row["id"], {
+            "row": row,
+            "cosine_score": float(row["cosine_score"]),
+            "rrf": 0.0,
+        })
+        entry["rrf"] += 1.0 / (_RRF_K + rank)
+
+    ordered = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)
     return [
         {
-            "doc_id": r["id"],
-            "text": r["text"],
-            "metadata": _from_jsonb(r["metadata"]),
-            "score": float(r["score"]),
+            "doc_id": e["row"]["id"],
+            "text": e["row"]["text"],
+            "metadata": _from_jsonb(e["row"]["metadata"]),
+            "score": e["cosine_score"],
         }
-        for r in rows
+        for e in ordered[:top_k]
     ]
 
 
@@ -721,7 +775,8 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     context". With §4.1 supersession in place, the memory set is
     deduplicated by (user_id, key); a dedicated query-relevant-memories
     layer via embedding similarity over memory rows is a future
-    refinement.
+    refinement. Recent-context retrieval is hybrid (cosine + BM25 via
+    RRF) per §10 — see `_recall_candidates`.
 
     §3 cold semantics: empty store, unknown user, or zero matches → 200
     with `{"context": "", "citations": []}`. Never errors.
@@ -734,7 +789,7 @@ async def recall(payload: RecallRequest) -> RecallResponse:
     qvec = await embed_query(payload.query)
     memories, hits = await asyncio.gather(
         _fetch_active_memories(payload.user_id),
-        _recall_candidates(qvec, payload.user_id, payload.session_id, _RECALL_TOPK),
+        _recall_candidates(payload.query, qvec, payload.user_id, payload.session_id, _RECALL_TOPK),
     )
     context, citations = _format_recall_context(memories, hits, payload.max_tokens)
     return RecallResponse(

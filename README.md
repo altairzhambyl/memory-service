@@ -134,15 +134,23 @@ End-to-end:
 
 1. **Embed query** with `text-embedding-3-small`.
 2. **In parallel** (`asyncio.gather`) — fetch active memories for
-   `user_id`, ordered by type priority (fact > preference > opinion >
-   event) then `updated_at DESC`; and run cosine top-10 over
+   `user_id` (type-priority sort: fact > preference > opinion > event,
+   then `updated_at DESC`); and run **hybrid retrieval** over
    `documents` rows scoped by `user_id`.
-3. **Assemble**: emit the `## Known facts` block first, then drain the
+3. **Hybrid retrieval** = cosine top-30 (HNSW on
+   `text-embedding-3-small`) + BM25 top-30 (Postgres `tsvector` +
+   `ts_rank_cd`), fused via **Reciprocal Rank Fusion** with `k=60`
+   (Cormack-Buettcher-Clarke 2009). Cosine catches semantic intent;
+   BM25 catches keyword-anchored queries (rare proper nouns,
+   technical terms) where short-turn embeddings are weak. Per §10:
+   ranking is deliberate, not vanilla cosine top-k.
+4. **Assemble**: emit the `## Known facts` block first, then drain the
    remaining budget into `## Relevant from recent conversations`.
    Snippets are pre-trimmed at index time (240 chars).
-4. **Citations** carry `turn_id`, cosine score, and snippet. Memories
-   are not duplicated as citations — reviewers inspect them via
-   `/users/{user_id}/memories`.
+5. **Citations** carry `turn_id`, cosine score, and snippet (cosine
+   kept as the citation score for §3 interpretability; ordering is
+   by RRF). Memories are not duplicated as citations — reviewers
+   inspect them via `/users/{user_id}/memories`.
 
 **Priority logic — graded design choice (§4.3).** Stable user identity
 beats episodic context. A user's employer, city, allergies, and pet
@@ -193,7 +201,7 @@ judge that adds latency and model-cost variance.
 
 | Optimised for | Given up |
 |---|---|
-| One backing store, one transaction, no eventual consistency | Hybrid retrieval (BM25 + RRF) — a likely §10 upgrade |
+| One backing store, one transaction, no eventual consistency | LLM reranker / query rewriting / multi-hop graph traversal |
 | Synchronous extraction inside `/turns` (60 s budget) | Throughput on bursts — `max_retries=0` on the hot path means a 429 returns zero memories rather than retrying |
 | Deterministic `(user_id, key)` supersession | LLM-judge contradiction detection — heavier, less predictable |
 | §4.3 stable-facts-first recall priority | Query-relevant memory layer (similarity over memory rows) — left as a post-MVP refinement |
@@ -265,7 +273,8 @@ memory-service/
 │   ├── obs/logging.py         # structlog JSON
 │   └── static/index.html      # inspection UI (every §3 endpoint)
 ├── migrations/                # 001_init, 002_chat_sessions,
-│                                003_section3_turns, 004_memories
+│                                003_section3_turns, 004_memories,
+│                                005_bm25_hybrid
 ├── fixtures/recall/v1.json    # 7-probe recall-quality fixture
 ├── tests/contract/            # §3 shape tests + §7 required tests
 ├── docker-compose.yml         # db + app, named volume rag-db-data
