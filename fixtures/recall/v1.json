@@ -1,0 +1,131 @@
+{
+  "_comment": "Recall-quality fixture v1. Three short conversations + 7 probes covering employment+location, pet, dietary preferences, and a noise probe. Used by POST /admin/run_fixture to compute recall@1 / recall@3 / noise resistance / mean top-score. Per the requirements: 'Build this fixture early; run it after every change.' All user_ids must start with 'fix-' so the admin endpoint can reset them safely without touching real data.",
+  "name": "recall-v1",
+  "noise_max_top_score": 0.35,
+  "conversations": [
+    {
+      "user_id": "fix-berlin",
+      "turns": [
+        {
+          "label": "moved-berlin",
+          "session_id": "fix-berlin-s1",
+          "timestamp": "2026-04-01T10:00:00Z",
+          "messages": [
+            { "role": "user", "content": "I just moved to Berlin from NYC last month. Loving it so far." },
+            { "role": "assistant", "content": "That's exciting! Berlin is a great city. How are you settling in?" }
+          ]
+        },
+        {
+          "label": "started-notion",
+          "session_id": "fix-berlin-s2",
+          "timestamp": "2026-04-15T11:00:00Z",
+          "messages": [
+            { "role": "user", "content": "I just started at Notion this week as a product manager. Left Stripe last month — needed a change after four years of engineering work." },
+            { "role": "assistant", "content": "Congrats on the new role! How are you finding PM work compared to engineering at Stripe?" }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-pet",
+      "turns": [
+        {
+          "label": "got-biscuit",
+          "session_id": "fix-pet-s1",
+          "timestamp": "2026-03-20T18:00:00Z",
+          "messages": [
+            { "role": "user", "content": "We just adopted a dog yesterday — a beagle named Biscuit. He's three years old and already knows sit and stay." },
+            { "role": "assistant", "content": "Welcome to the family, Biscuit! Beagles are wonderful — how is he settling in?" }
+          ]
+        },
+        {
+          "label": "walking-biscuit",
+          "session_id": "fix-pet-s2",
+          "timestamp": "2026-04-10T07:30:00Z",
+          "messages": [
+            { "role": "user", "content": "Just got back from walking Biscuit in the park. Beautiful morning." },
+            { "role": "assistant", "content": "Sounds lovely. Beagles need a lot of exercise — daily walks help a lot." }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-diet",
+      "turns": [
+        {
+          "label": "veg-allergy",
+          "session_id": "fix-diet-s1",
+          "timestamp": "2026-04-05T19:00:00Z",
+          "messages": [
+            { "role": "user", "content": "I'm vegetarian and I'm allergic to shellfish. Also I don't drink coffee — caffeine wrecks my sleep." },
+            { "role": "assistant", "content": "Got it. I'll keep those constraints in mind for any food or restaurant suggestions." }
+          ]
+        }
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "label": "where-live",
+      "query": "Where does this user live?",
+      "user_id": "fix-berlin",
+      "session_id": "fix-berlin-recall",
+      "max_tokens": 512,
+      "expected_turn_label": "moved-berlin",
+      "expected_any_substring": ["Berlin"]
+    },
+    {
+      "label": "current-job",
+      "query": "What does this user do for work right now?",
+      "user_id": "fix-berlin",
+      "session_id": "fix-berlin-recall",
+      "max_tokens": 512,
+      "expected_turn_label": "started-notion",
+      "expected_any_substring": ["Notion", "product manager"]
+    },
+    {
+      "label": "pet-name",
+      "query": "What is the name of the user's dog?",
+      "user_id": "fix-pet",
+      "session_id": "fix-pet-recall",
+      "max_tokens": 512,
+      "expected_turn_label": "got-biscuit",
+      "expected_any_substring": ["Biscuit"]
+    },
+    {
+      "label": "pet-implicit",
+      "query": "Does this user own any pets?",
+      "user_id": "fix-pet",
+      "session_id": "fix-pet-recall",
+      "max_tokens": 512,
+      "expected_turn_label": "got-biscuit",
+      "expected_any_substring": ["Biscuit", "dog", "beagle"]
+    },
+    {
+      "label": "is-vegetarian",
+      "query": "Is this user vegetarian or has dietary restrictions?",
+      "user_id": "fix-diet",
+      "session_id": "fix-diet-recall",
+      "max_tokens": 512,
+      "expected_turn_label": "veg-allergy",
+      "expected_any_substring": ["vegetarian"]
+    },
+    {
+      "label": "shellfish",
+      "query": "Can this user eat shrimp or shellfish?",
+      "user_id": "fix-diet",
+      "session_id": "fix-diet-recall",
+      "max_tokens": 512,
+      "expected_turn_label": "veg-allergy",
+      "expected_any_substring": ["shellfish", "allergic"]
+    },
+    {
+      "label": "noise-horse",
+      "query": "Does this user own a horse?",
+      "user_id": "fix-pet",
+      "session_id": "fix-pet-recall",
+      "max_tokens": 512,
+      "noise": true
+    }
+  ]
+}

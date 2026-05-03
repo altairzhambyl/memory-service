@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
 
 COPY --chown=app:app app ./app
 COPY --chown=app:app migrations ./migrations
+COPY --chown=app:app fixtures ./fixtures
 
 USER app
 

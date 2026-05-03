@@ -198,3 +198,49 @@ class TurnIndexResponse(BaseModel):
     documents_count: int
     embeddings_count: int
     rows: list[TurnIndexRow]
+
+
+# ---------- Admin: POST /admin/run_fixture ----------
+# Loads a JSON fixture from fixtures/recall/<name>.json, ingests its
+# conversations, runs probes through /recall, and reports per-probe
+# verdicts plus aggregate metrics. Recall-quality measurement harness
+# the requirements.
+
+class RunFixtureRequest(BaseModel):
+    name: str = Field(default="v1", min_length=1)
+
+
+class FixtureProbeResult(BaseModel):
+    label: str
+    query: str
+    is_noise: bool = False
+    expected_turn_label: str | None = None
+    expected_substrings: list[str] = Field(default_factory=list)
+    top_hit_turn_label: str | None = None
+    top_score: float | None = None
+    citations_count: int = 0
+    passed_top1: bool = False
+    passed_top3: bool = False
+    substring_match: bool = False
+    passed: bool = False
+    notes: str = ""
+
+
+class FixtureAggregate(BaseModel):
+    name: str
+    total: int
+    positive_total: int
+    positive_passed_top1: int
+    positive_passed_top3: int
+    noise_total: int
+    noise_passed: int
+    recall_at_1: float
+    recall_at_3: float
+    noise_resistance: float
+    mean_top_score: float
+
+
+class RunFixtureResponse(BaseModel):
+    aggregate: FixtureAggregate
+    probes: list[FixtureProbeResult]
+    elapsed_ms: int

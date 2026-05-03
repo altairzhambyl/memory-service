@@ -538,6 +538,22 @@
       overflow-wrap: anywhere;
     }
 
+    .s3-table tr.row-pass td:first-child {
+      box-shadow: inset 3px 0 0 var(--green);
+    }
+
+    .s3-table tr.row-fail td:first-child {
+      box-shadow: inset 3px 0 0 var(--red);
+    }
+
+    .s3-verdict {
+      font-weight: 650;
+    }
+
+    .s3-verdict.pass { color: var(--green); }
+    .s3-verdict.fail { color: var(--red); }
+    .s3-verdict.noise { color: var(--muted); font-weight: 500; }
+
     .s3-empty {
       color: var(--muted);
       font-size: 12px;
@@ -679,6 +695,27 @@
             <button class="s3-action danger" id="s3DeleteSessionBtn" type="button">DELETE /sessions/&lt;session_id&gt;</button>
           </div>
           <pre class="s3-output" id="s3DeleteResult">No request sent yet.</pre>
+        </article>
+
+        <article class="s3-card">
+          <h2>5. Recall-quality fixture — measurable iteration</h2>
+          <p class="desc">Loads <code>fixtures/recall/&lt;name&gt;.json</code>, resets each <code>fix-*</code> user, ingests its conversations through the real <code>POST /turns</code> path, then probes <code>/recall</code> and reports verdicts. Every retrieval upgrade should beat the last run on this same fixture.</p>
+          <div class="s3-row">
+            <input id="s3FixtureName" placeholder="fixture name" value="v1">
+          </div>
+          <div class="s3-actions">
+            <button class="s3-action" id="s3RunFixtureBtn" type="button">Run fixture</button>
+          </div>
+          <div class="s3-counts" id="s3FixtureAggregate">
+            <span class="s3-pill">recall@1: <strong>—</strong></span>
+            <span class="s3-pill">recall@3: <strong>—</strong></span>
+            <span class="s3-pill">noise resistance: <strong>—</strong></span>
+            <span class="s3-pill">mean top-score: <strong>—</strong></span>
+            <span class="s3-pill">elapsed: <strong>—</strong></span>
+          </div>
+          <div id="s3FixtureTableWrap">
+            <p class="s3-empty">Click "Run fixture" — destructive on <code>fix-*</code> users only.</p>
+          </div>
         </article>
       </section>
 
@@ -1064,6 +1101,10 @@
       deleteResult: document.querySelector("#s3DeleteResult"),
       deleteUserBtn: document.querySelector("#s3DeleteUserBtn"),
       deleteSessionBtn: document.querySelector("#s3DeleteSessionBtn"),
+      fixtureName: document.querySelector("#s3FixtureName"),
+      runFixtureBtn: document.querySelector("#s3RunFixtureBtn"),
+      fixtureAggregate: document.querySelector("#s3FixtureAggregate"),
+      fixtureTableWrap: document.querySelector("#s3FixtureTableWrap"),
     };
 
     function s3DefaultPayload(userId, sessionId) {
@@ -1252,6 +1293,74 @@
 
     s3.deleteUserBtn.addEventListener("click", s3DeleteUser);
     s3.deleteSessionBtn.addEventListener("click", s3DeleteSession);
+
+    function s3RenderFixture(data) {
+      const a = data.aggregate;
+      const r1 = `${a.positive_passed_top1}/${a.positive_total}`;
+      const r3 = `${a.positive_passed_top3}/${a.positive_total}`;
+      const noise = a.noise_total ? `${a.noise_passed}/${a.noise_total}` : "—";
+      const r1Class = a.positive_total && a.positive_passed_top1 === a.positive_total ? "" : (a.positive_passed_top1 ? "" : "warn");
+      s3.fixtureAggregate.innerHTML =
+        `<span class="s3-pill ${r1Class}">recall@1: <strong>${r1} (${(a.recall_at_1 * 100).toFixed(0)}%)</strong></span>` +
+        `<span class="s3-pill">recall@3: <strong>${r3} (${(a.recall_at_3 * 100).toFixed(0)}%)</strong></span>` +
+        `<span class="s3-pill">noise resistance: <strong>${noise}</strong></span>` +
+        `<span class="s3-pill">mean top-score: <strong>${a.mean_top_score.toFixed(3)}</strong></span>` +
+        `<span class="s3-pill">elapsed: <strong>${data.elapsed_ms} ms</strong></span>`;
+
+      const rowsHtml = data.probes.map((p) => {
+        const score = p.top_score != null ? p.top_score.toFixed(3) : "—";
+        const verdict = p.is_noise
+          ? `<span class="s3-verdict ${p.passed ? "pass" : "fail"}">${p.passed ? "noise OK" : "noise FAIL"}</span>`
+          : `<span class="s3-verdict ${p.passed ? "pass" : "fail"}">${p.passed ? "PASS" : "FAIL"}</span>`;
+        const expected = p.is_noise ? "—" : escapeHtml(p.expected_turn_label || "");
+        const got = escapeHtml(p.top_hit_turn_label || "—");
+        const subs = p.is_noise
+          ? "—"
+          : (p.expected_substrings.length ? `<span class="s3-verdict ${p.substring_match ? "pass" : "fail"}">${p.substring_match ? "✓" : "✗"}</span>` : "—");
+        const top3 = p.is_noise ? "—" : (p.passed_top3 ? "✓" : "✗");
+        const cls = p.passed ? "row-pass" : "row-fail";
+        return `<tr class="${cls}">
+          <td>${escapeHtml(p.label)}</td>
+          <td>${escapeHtml(p.query)}</td>
+          <td>${expected}</td>
+          <td>${got}</td>
+          <td>${score}</td>
+          <td>${top3}</td>
+          <td>${subs}</td>
+          <td>${verdict}</td>
+        </tr>`;
+      }).join("");
+
+      s3.fixtureTableWrap.innerHTML = `
+        <table class="s3-table">
+          <thead><tr>
+            <th>label</th><th>query</th><th>expected</th><th>top-hit</th><th>score</th><th>top3</th><th>sub</th><th>verdict</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      `;
+    }
+
+    async function s3RunFixture() {
+      const name = s3.fixtureName.value.trim() || "v1";
+      s3.runFixtureBtn.disabled = true;
+      s3.fixtureTableWrap.innerHTML = '<p class="s3-empty">Running fixture — embedding + ingest can take a few seconds…</p>';
+      try {
+        const data = await requestJson("/admin/run_fixture", {
+          method: "POST",
+          body: JSON.stringify({ name }),
+        });
+        s3RenderFixture(data);
+        s3RefreshIndex();
+      } catch (err) {
+        s3.fixtureAggregate.innerHTML = `<span class="s3-pill warn"><strong>Error: ${escapeHtml(err.message)}</strong></span>`;
+        s3.fixtureTableWrap.innerHTML = "";
+      } finally {
+        s3.runFixtureBtn.disabled = false;
+      }
+    }
+
+    s3.runFixtureBtn.addEventListener("click", s3RunFixture);
 
     document.querySelector("#composer").addEventListener("submit", (event) => {
       event.preventDefault();

@@ -37,11 +37,13 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "8080:8080"
-    # Live-mount static UI so HTML/CSS/JS edits don't need a rebuild.
-    # Backend code still lives inside the image; for app/ changes use the
-    # uvicorn --reload local workflow described in the README.
+    # Live-mount static UI + recall fixtures so HTML/CSS/JS and fixture
+    # JSON edits don't need a rebuild. Backend code still lives inside
+    # the image; for app/ changes use the uvicorn --reload local workflow
+    # described in the README.
     volumes:
       - ./app/static:/app/app/static:ro
+      - ./fixtures:/app/fixtures:ro
     restart: unless-stopped
 
 volumes:
