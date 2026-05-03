@@ -1,0 +1,278 @@
+{
+  "_comment": "Recall-quality fixture v2 (HGT-22). Stress-tests the §9 categories the private eval explicitly names — multi-hop linkage, keyword-anchored retrieval, supersession arcs (opinion + employment), noise resistance, implicit facts — plus tight-budget priority assembly probes that prove HGT-19 facts-first ordering is query-aware (not 'dump everything'). Every user_id starts with 'fix-' so /admin/run_fixture can reset safely.",
+  "name": "recall-v2",
+  "noise_max_top_score": 0.30,
+  "conversations": [
+    {
+      "user_id": "fix-mh-pet-city",
+      "_purpose": "Multi-hop probe: pet name in one turn, city in another. Expected: Known facts block fuses both.",
+      "turns": [
+        {
+          "label": "mh-got-biscuit",
+          "session_id": "fix-mh-pet-city-s1",
+          "timestamp": "2026-03-20T18:00:00Z",
+          "messages": [
+            { "role": "user", "content": "Just got my dog Biscuit yesterday — he's a beagle, three years old." },
+            { "role": "assistant", "content": "Welcome to the family, Biscuit!" }
+          ]
+        },
+        {
+          "label": "mh-moved-berlin",
+          "session_id": "fix-mh-pet-city-s2",
+          "timestamp": "2026-04-01T10:00:00Z",
+          "messages": [
+            { "role": "user", "content": "Loving Berlin so far, moved here from NYC last month." },
+            { "role": "assistant", "content": "Berlin is a great city. How are you settling in?" }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-kw-stripe",
+      "_purpose": "Keyword-anchored vs distractor-paraphrase: probe `Stripe` should pick the literal-token turn even though the distractor is semantically richer.",
+      "turns": [
+        {
+          "label": "kw-stripe-literal",
+          "session_id": "fix-kw-stripe-s1",
+          "timestamp": "2026-04-15T11:00:00Z",
+          "messages": [
+            { "role": "user", "content": "Left Stripe last month after four years there." },
+            { "role": "assistant", "content": "Big change. What's next?" }
+          ]
+        },
+        {
+          "label": "kw-stripe-distractor",
+          "session_id": "fix-kw-stripe-s1",
+          "timestamp": "2026-04-15T11:05:00Z",
+          "messages": [
+            { "role": "user", "content": "My old company was very large and well-known, I worked there for years before joining a smaller startup. I miss the scale of the engineering teams there but the small team is more fun." },
+            { "role": "assistant", "content": "That's a familiar trade-off." }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-tight-budget-mix",
+      "_purpose": "Ten facts on one user. Tight-budget probes should surface query-relevant facts only. Today this fails (HGT-19 is type-priority sorted, not query-aware) — that failure is HGT-23's acceptance metric.",
+      "turns": [
+        {
+          "label": "tb-employment",
+          "session_id": "fix-tight-budget-mix-s1",
+          "timestamp": "2026-04-01T09:00:00Z",
+          "messages": [
+            { "role": "user", "content": "I work at Notion as a product manager." },
+            { "role": "assistant", "content": "Cool." }
+          ]
+        },
+        {
+          "label": "tb-location",
+          "session_id": "fix-tight-budget-mix-s1",
+          "timestamp": "2026-04-01T09:01:00Z",
+          "messages": [
+            { "role": "user", "content": "I live in Berlin, moved from NYC last year." },
+            { "role": "assistant", "content": "Nice." }
+          ]
+        },
+        {
+          "label": "tb-pet1",
+          "session_id": "fix-tight-budget-mix-s1",
+          "timestamp": "2026-04-01T09:02:00Z",
+          "messages": [
+            { "role": "user", "content": "I have a cat named Mochi." },
+            { "role": "assistant", "content": "Sweet name." }
+          ]
+        },
+        {
+          "label": "tb-pet2",
+          "session_id": "fix-tight-budget-mix-s1",
+          "timestamp": "2026-04-01T09:03:00Z",
+          "messages": [
+            { "role": "user", "content": "Also have a dog named Biscuit, a three-year-old beagle." },
+            { "role": "assistant", "content": "Two pets!" }
+          ]
+        },
+        {
+          "label": "tb-diet",
+          "session_id": "fix-tight-budget-mix-s1",
+          "timestamp": "2026-04-01T09:04:00Z",
+          "messages": [
+            { "role": "user", "content": "I'm vegetarian and allergic to shellfish. Also I don't drink coffee." },
+            { "role": "assistant", "content": "Noted." }
+          ]
+        },
+        {
+          "label": "tb-opinion",
+          "session_id": "fix-tight-budget-mix-s1",
+          "timestamp": "2026-04-01T09:05:00Z",
+          "messages": [
+            { "role": "user", "content": "Honestly I think TypeScript generics are over-engineered." },
+            { "role": "assistant", "content": "A common take." }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-arc-typescript",
+      "_purpose": "Supersession arc on opinion. Three statements over time; only the latest opinion should appear in /recall, full chain in /users/{id}/memories.",
+      "turns": [
+        {
+          "label": "arc-ts-love",
+          "session_id": "fix-arc-typescript-s1",
+          "timestamp": "2026-02-01T10:00:00Z",
+          "messages": [
+            { "role": "user", "content": "I love TypeScript, it's my favourite language." },
+            { "role": "assistant", "content": "Strong type system has its fans." }
+          ]
+        },
+        {
+          "label": "arc-ts-annoy",
+          "session_id": "fix-arc-typescript-s2",
+          "timestamp": "2026-03-01T10:00:00Z",
+          "messages": [
+            { "role": "user", "content": "TypeScript generics actually annoy me lately, I find them over-engineered." },
+            { "role": "assistant", "content": "Generics are tricky." }
+          ]
+        },
+        {
+          "label": "arc-ts-pragmatic",
+          "session_id": "fix-arc-typescript-s3",
+          "timestamp": "2026-04-01T10:00:00Z",
+          "messages": [
+            { "role": "user", "content": "Settled on TypeScript for big projects, Python for small scripts. That balance works for me." },
+            { "role": "assistant", "content": "Pragmatic split." }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-arc-employer",
+      "_purpose": "Supersession arc on employer. /recall should report Notion (current); /users/{id}/memories shows Stripe inactive.",
+      "turns": [
+        {
+          "label": "arc-emp-stripe",
+          "session_id": "fix-arc-employer-s1",
+          "timestamp": "2026-01-15T10:00:00Z",
+          "messages": [
+            { "role": "user", "content": "I work at Stripe as a payments engineer." },
+            { "role": "assistant", "content": "Big infrastructure work." }
+          ]
+        },
+        {
+          "label": "arc-emp-notion",
+          "session_id": "fix-arc-employer-s2",
+          "timestamp": "2026-04-15T11:00:00Z",
+          "messages": [
+            { "role": "user", "content": "Just started at Notion as a PM this week." },
+            { "role": "assistant", "content": "Congrats on the new role." }
+          ]
+        }
+      ]
+    },
+    {
+      "user_id": "fix-imp-pet",
+      "_purpose": "Implicit-fact probe: 'walking Biscuit' implies pet ownership without naming the species directly.",
+      "turns": [
+        {
+          "label": "imp-walking-biscuit",
+          "session_id": "fix-imp-pet-s1",
+          "timestamp": "2026-04-10T07:30:00Z",
+          "messages": [
+            { "role": "user", "content": "Just got back from walking Biscuit in the park. Beautiful morning." },
+            { "role": "assistant", "content": "Sounds lovely." }
+          ]
+        }
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "label": "multihop-pet-city",
+      "query": "What city does the user with the dog named Biscuit live in?",
+      "user_id": "fix-mh-pet-city",
+      "session_id": "fix-mh-pet-city-recall",
+      "max_tokens": 1024,
+      "expected_known_facts": [
+        { "key": "pet.name", "value_substring": "Biscuit" },
+        { "key": "location.city", "value_substring": "Berlin" }
+      ]
+    },
+    {
+      "label": "kw-stripe",
+      "query": "Stripe",
+      "user_id": "fix-kw-stripe",
+      "session_id": "fix-kw-stripe-recall",
+      "max_tokens": 1024,
+      "expected_turn_label": "kw-stripe-literal",
+      "expected_any_substring": ["Stripe"]
+    },
+    {
+      "label": "tight-budget-diet",
+      "query": "What does this user eat?",
+      "user_id": "fix-tight-budget-mix",
+      "session_id": "fix-tight-budget-mix-recall",
+      "max_tokens": 200,
+      "expected_known_facts": [
+        { "key": "diet.style", "value_substring": "vegetarian" }
+      ],
+      "forbidden_known_facts": [
+        { "key_prefix": "employment." },
+        { "key_prefix": "pet." },
+        { "key_prefix": "opinion." }
+      ]
+    },
+    {
+      "label": "tight-budget-employment",
+      "query": "Where does this user work?",
+      "user_id": "fix-tight-budget-mix",
+      "session_id": "fix-tight-budget-mix-recall",
+      "max_tokens": 200,
+      "expected_known_facts": [
+        { "key": "employment.company", "value_substring": "Notion" }
+      ],
+      "forbidden_known_facts": [
+        { "key_prefix": "pet." },
+        { "key_prefix": "diet." },
+        { "key_prefix": "allergy" },
+        { "key_prefix": "opinion." }
+      ]
+    },
+    {
+      "label": "arc-typescript-current",
+      "query": "What does the user think of TypeScript?",
+      "user_id": "fix-arc-typescript",
+      "session_id": "fix-arc-typescript-recall",
+      "max_tokens": 1024,
+      "expected_supersession": { "key_prefix": "opinion.", "min_inactive_rows": 1 }
+    },
+    {
+      "label": "arc-employer-current",
+      "query": "Where does this user currently work?",
+      "user_id": "fix-arc-employer",
+      "session_id": "fix-arc-employer-recall",
+      "max_tokens": 1024,
+      "expected_known_facts": [
+        { "key": "employment.company", "value_substring": "Notion" }
+      ],
+      "expected_supersession": { "key": "employment.company", "min_inactive_rows": 1 }
+    },
+    {
+      "label": "noise-quantum",
+      "query": "What is the user's opinion on quantum computing?",
+      "user_id": "fix-arc-typescript",
+      "session_id": "fix-arc-typescript-recall",
+      "max_tokens": 1024,
+      "noise": true,
+      "expected_top_score_under": 0.30
+    },
+    {
+      "label": "implicit-pet",
+      "query": "Does this user have any pets?",
+      "user_id": "fix-imp-pet",
+      "session_id": "fix-imp-pet-recall",
+      "max_tokens": 1024,
+      "expected_known_facts": [
+        { "key": "pet.name", "value_substring": "Biscuit" }
+      ]
+    }
+  ]
+}

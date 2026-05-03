@@ -1328,12 +1328,35 @@
       const failBreakdown = Object.keys(a.extraction_error_modes || {}).length
         ? " (" + Object.entries(a.extraction_error_modes).map(([k, v]) => `${escapeHtml(k)}:${v}`).join(", ") + ")"
         : "";
+      // HGT-22 v2 pills. Render only when the fixture exercises that
+      // dimension so v1 stays visually unchanged.
+      const mhPill = a.multihop_total
+        ? `<span class="s3-pill ${a.multihop_passed_top1 === a.multihop_total ? "" : "warn"}">multi-hop@1: <strong>${a.multihop_passed_top1}/${a.multihop_total}</strong></span>`
+        : "";
+      const factsPill = a.facts_expected
+        ? `<span class="s3-pill ${a.facts_present === a.facts_expected ? "" : "warn"}">facts present: <strong>${a.facts_present}/${a.facts_expected}</strong></span>`
+        : "";
+      const forbiddenPill = a.facts_expected
+        ? `<span class="s3-pill ${a.forbidden_facts_violations === 0 ? "" : "warn"}">forbidden facts: <strong>${a.forbidden_facts_violations}</strong></span>`
+        : "";
+      const supersedePill = a.supersession_chains_expected
+        ? `<span class="s3-pill ${a.supersession_chains_resolved === a.supersession_chains_expected ? "" : "warn"}">supersession chains: <strong>${a.supersession_chains_resolved}/${a.supersession_chains_expected}</strong></span>`
+        : "";
+      const ingestPill = a.ingest_failures
+        ? `<span class="s3-pill warn">ingest failures: <strong>${a.ingest_failures}</strong></span>`
+        : "";
+
       s3.fixtureAggregate.innerHTML =
         `<span class="s3-pill ${r1Class}">recall@1: <strong>${r1} (${(a.recall_at_1 * 100).toFixed(0)}%)</strong></span>` +
         `<span class="s3-pill">recall@3: <strong>${r3} (${(a.recall_at_3 * 100).toFixed(0)}%)</strong></span>` +
+        mhPill +
         `<span class="s3-pill">noise resistance: <strong>${noise}</strong></span>` +
         `<span class="s3-pill">mean top-score: <strong>${a.mean_top_score.toFixed(3)}</strong></span>` +
+        factsPill +
+        forbiddenPill +
+        supersedePill +
         `<span class="s3-pill ${failClass}">extraction failures: <strong>${a.extraction_failures}</strong>${failBreakdown}</span>` +
+        ingestPill +
         `<span class="s3-pill">elapsed: <strong>${data.elapsed_ms} ms</strong></span>`;
 
       const rowsHtml = data.probes.map((p) => {

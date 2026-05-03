@@ -1131,6 +1131,64 @@ def _parse_iso_z(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+_KNOWN_FACTS_HEADER = "## Known facts about this user"
+
+
+def _parse_known_facts_block(context: str) -> list[tuple[str, str]]:
+    """
+    Pull `(key, value)` pairs out of the `## Known facts about this user`
+    section of a /recall context. Format mirrors `_format_recall_context`:
+    `- {key}: {value}` per bullet. Returns [] if the block is absent.
+    """
+    if _KNOWN_FACTS_HEADER not in context:
+        return []
+    out: list[tuple[str, str]] = []
+    in_block = False
+    for line in context.splitlines():
+        if line.startswith(_KNOWN_FACTS_HEADER):
+            in_block = True
+            continue
+        if line.startswith("## "):
+            in_block = False
+            continue
+        if in_block and line.startswith("- ") and ": " in line:
+            entry = line[2:]
+            key, value = entry.split(": ", 1)
+            out.append((key.strip(), value.strip()))
+    return out
+
+
+async def _count_inactive_rows(
+    user_id: str,
+    *,
+    key: str | None = None,
+    key_prefix: str | None = None,
+) -> int:
+    """
+    Count `memories` rows where active=FALSE for a (user_id, key)
+    selector. HGT-22 supersession-arc probes use this to verify
+    /users/{id}/memories preserves the chain. Either `key` (exact match)
+    or `key_prefix` (LIKE) must be provided.
+    """
+    if key is None and key_prefix is None:
+        return 0
+    pool = get_pool()
+    if key is not None:
+        sql = (
+            "SELECT count(*) FROM memories "
+            "WHERE user_id = $1 AND active = FALSE AND key = $2"
+        )
+        args = (user_id, key)
+    else:
+        sql = (
+            "SELECT count(*) FROM memories "
+            "WHERE user_id = $1 AND active = FALSE AND key LIKE $2"
+        )
+        args = (user_id, f"{key_prefix}%")
+    async with pool.acquire() as conn:
+        return int(await conn.fetchval(sql, *args) or 0)
+
+
 @router.post("/admin/inject_embed_failure")
 async def admin_inject_embed_failure(
     count: int = Query(default=1, ge=0, le=100),
@@ -1225,6 +1283,12 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
     positive_top1 = positive_top3 = positive_total = 0
     noise_passed = noise_total = 0
     positive_top_scores: list[float] = []
+    # HGT-22 v2 aggregations.
+    multihop_total = multihop_top1 = multihop_top3 = 0
+    facts_expected_total = facts_present_total = 0
+    forbidden_total = 0
+    supersession_chains_resolved = supersession_chains_expected = 0
+    noise_top_score_violations = 0
 
     for probe in fixture["probes"]:
         is_noise = bool(probe.get("noise", False))
@@ -1238,10 +1302,54 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         cites = rec_resp.citations
         top_score = cites[0].score if cites else None
         top_label = turn_id_to_label.get(cites[0].turn_id) if cites else None
+        known_facts = _parse_known_facts_block(rec_resp.context)
+
+        # ---- HGT-22: per-probe v2 evaluations (independent of pos/noise) ----
+        expected_facts = list(probe.get("expected_known_facts", []))
+        forbidden_facts = list(probe.get("forbidden_known_facts", []))
+        expected_supersession = probe.get("expected_supersession")
+        per_probe_top_threshold = probe.get("expected_top_score_under")
+
+        facts_present = sum(
+            1
+            for ef in expected_facts
+            if any(
+                k == ef["key"] and ef["value_substring"].lower() in v.lower()
+                for k, v in known_facts
+            )
+        )
+        forbidden_violated = sum(
+            1
+            for fk in forbidden_facts
+            if any(k.startswith(fk["key_prefix"]) for k, _ in known_facts)
+        )
+        chain_length: int | None = None
+        chain_min: int | None = None
+        if expected_supersession is not None:
+            chain_min = int(expected_supersession.get("min_inactive_rows", 1))
+            chain_length = await _count_inactive_rows(
+                probe["user_id"],
+                key=expected_supersession.get("key"),
+                key_prefix=expected_supersession.get("key_prefix"),
+            )
+            supersession_chains_expected += 1
+            if chain_length >= chain_min:
+                supersession_chains_resolved += 1
+
+        facts_expected_total += len(expected_facts)
+        facts_present_total += facts_present
+        forbidden_total += forbidden_violated
 
         if is_noise:
             noise_total += 1
-            ok = (not cites) or (top_score is not None and top_score < noise_max_top)
+            threshold = (
+                float(per_probe_top_threshold)
+                if per_probe_top_threshold is not None
+                else noise_max_top
+            )
+            ok = (not cites) or (top_score is not None and top_score < threshold)
+            if not ok:
+                noise_top_score_violations += 1
             if ok:
                 noise_passed += 1
             probes_out.append(FixtureProbeResult(
@@ -1252,7 +1360,13 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
                 top_score=top_score,
                 citations_count=len(cites),
                 passed=ok,
-                notes=f"noise threshold < {noise_max_top}",
+                notes=f"noise threshold < {threshold}",
+                expected_top_score_under=per_probe_top_threshold,
+                expected_known_facts_total=len(expected_facts),
+                expected_known_facts_present=facts_present,
+                forbidden_known_facts_violated=forbidden_violated,
+                supersession_chain_length=chain_length,
+                supersession_expected_min=chain_min,
             ))
             continue
 
@@ -1261,18 +1375,48 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         expected_id = label_to_turn_id.get(expected_label) if expected_label else None
         expected_subs = list(probe.get("expected_any_substring", []))
 
-        passed_top1 = bool(cites) and cites[0].turn_id == expected_id
-        passed_top3 = any(c.turn_id == expected_id for c in cites[:3])
-        substring_match = False
-        if cites and expected_subs:
-            joined = " ".join(c.snippet for c in cites[:3]).lower()
-            substring_match = any(s.lower() in joined for s in expected_subs)
-        passed = passed_top1 and substring_match
+        # Multi-hop classification: a probe is multi-hop if it expects
+        # ≥2 distinct fact keys in the Known-facts block. These probes
+        # don't have a single "expected_turn_label" — the answer is
+        # synthesised from facts. Reported separately so v1 and v2
+        # numbers stay comparable.
+        is_multihop = len({ef["key"] for ef in expected_facts}) >= 2
 
-        if passed_top1:
-            positive_top1 += 1
-        if passed_top3:
-            positive_top3 += 1
+        if is_multihop:
+            multihop_total += 1
+            multihop_passed_top1 = facts_present == len(expected_facts)
+            multihop_passed_top3 = multihop_passed_top1  # facts block is single-shot
+            if multihop_passed_top1:
+                multihop_top1 += 1
+            if multihop_passed_top3:
+                multihop_top3 += 1
+            passed_top1 = multihop_passed_top1
+            passed_top3 = multihop_passed_top3
+            substring_match = passed_top1
+            passed = passed_top1 and forbidden_violated == 0
+        else:
+            passed_top1 = bool(cites) and cites[0].turn_id == expected_id
+            passed_top3 = any(c.turn_id == expected_id for c in cites[:3])
+            substring_match = False
+            if cites and expected_subs:
+                joined = " ".join(c.snippet for c in cites[:3]).lower()
+                substring_match = any(s.lower() in joined for s in expected_subs)
+            # When the probe carries v2 expectations, fold them into pass/fail.
+            facts_ok = facts_present == len(expected_facts)
+            forbidden_ok = forbidden_violated == 0
+            chain_ok = (
+                expected_supersession is None
+                or (chain_length is not None and chain_min is not None
+                    and chain_length >= chain_min)
+            )
+            base_pass = (passed_top1 and substring_match) if expected_label else True
+            passed = base_pass and facts_ok and forbidden_ok and chain_ok
+
+            if passed_top1:
+                positive_top1 += 1
+            if passed_top3:
+                positive_top3 += 1
+
         if top_score is not None:
             positive_top_scores.append(top_score)
 
@@ -1289,7 +1433,16 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
             passed_top3=passed_top3,
             substring_match=substring_match,
             passed=passed,
-            notes=f"expected={expected_label} got={top_label}",
+            notes=(
+                f"multi-hop facts {facts_present}/{len(expected_facts)}"
+                if is_multihop
+                else f"expected={expected_label} got={top_label}"
+            ),
+            expected_known_facts_total=len(expected_facts),
+            expected_known_facts_present=facts_present,
+            forbidden_known_facts_violated=forbidden_violated,
+            supersession_chain_length=chain_length,
+            supersession_expected_min=chain_min,
         ))
 
     # Surface extraction failures from the just-ingested fixture turns so
@@ -1330,6 +1483,17 @@ async def admin_run_fixture(payload: RunFixtureRequest) -> RunFixtureResponse:
         extraction_error_modes=extraction_error_modes,
         ingest_failures=ingest_failures,
         ingest_error_modes=ingest_error_modes,
+        multihop_total=multihop_total,
+        multihop_passed_top1=multihop_top1,
+        multihop_passed_top3=multihop_top3,
+        multihop_recall_at_1=(multihop_top1 / multihop_total) if multihop_total else 0.0,
+        multihop_recall_at_3=(multihop_top3 / multihop_total) if multihop_total else 0.0,
+        facts_expected=facts_expected_total,
+        facts_present=facts_present_total,
+        forbidden_facts_violations=forbidden_total,
+        supersession_chains_resolved=supersession_chains_resolved,
+        supersession_chains_expected=supersession_chains_expected,
+        noise_top_score_violations=noise_top_score_violations,
     )
     return RunFixtureResponse(
         aggregate=aggregate,
