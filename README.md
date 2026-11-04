@@ -16,8 +16,8 @@ references it via §-numbers throughout).
 > table, turn index). Use it for a click-driven manual demo.
 >
 > ```bash
-> git clone               git@github.com:kekeront/memory-service.git   # main = this branch, service only
-> git clone -b with-ui    git@github.com:kekeront/memory-service.git   # with inspection UI
+> git clone               https://github.com/altairzhambyl/memory-service.git   # main = this branch, service only
+> git clone -b with-ui    https://github.com/altairzhambyl/memory-service.git   # with inspection UI
 > ```
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
